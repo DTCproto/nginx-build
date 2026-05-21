@@ -1,28 +1,28 @@
-From 96abd3f4eb53ee09dc81b3d93efdea07c8701bcb Mon Sep 17 00:00:00 2001
+From 5abfb395d6ea507cac08a1051082fd6f7e591af2 Mon Sep 17 00:00:00 2001
 From: local <local@local>
-Date: Tue, 19 May 2026 05:40:24 +0800
-Subject: [PATCH] quic h3 support bbr v2.2(ds)
+Date: Fri, 22 May 2026 04:36:53 +0800
+Subject: [PATCH] quic h3 support bbr v2.3(ds)
 
-opencode fix
+claudecode fix
 ---
  auto/modules                               |    8 +
  src/event/quic/ngx_event_quic.c            |    8 +
  src/event/quic/ngx_event_quic.h            |   18 +
- src/event/quic/ngx_event_quic_ack.c        |  225 ++++-
- src/event/quic/ngx_event_quic_bbr.c        | 1041 ++++++++++++++++++++
+ src/event/quic/ngx_event_quic_ack.c        |  225 +++-
+ src/event/quic/ngx_event_quic_bbr.c        | 1122 ++++++++++++++++++++
  src/event/quic/ngx_event_quic_bbr.h        |   18 +
- src/event/quic/ngx_event_quic_brutal.c     |  384 ++++++++
+ src/event/quic/ngx_event_quic_brutal.c     |  384 +++++++
  src/event/quic/ngx_event_quic_brutal.h     |   18 +
- src/event/quic/ngx_event_quic_cc.c         |  513 ++++++++++
+ src/event/quic/ngx_event_quic_cc.c         |  513 +++++++++
  src/event/quic/ngx_event_quic_cc.h         |   91 ++
  src/event/quic/ngx_event_quic_connection.h |    5 +
  src/event/quic/ngx_event_quic_migration.c  |   11 +-
- src/event/quic/ngx_event_quic_output.c     |  112 ++-
- src/event/quic/ngx_event_quic_sampler.c    |  471 +++++++++
+ src/event/quic/ngx_event_quic_output.c     |  112 +-
+ src/event/quic/ngx_event_quic_sampler.c    |  488 +++++++++
  src/event/quic/ngx_event_quic_sampler.h    |  103 ++
  src/event/quic/ngx_event_quic_transport.h  |   13 +
  src/http/v3/ngx_http_v3_module.c           |  138 +++
- 17 files changed, 3147 insertions(+), 30 deletions(-)
+ 17 files changed, 3245 insertions(+), 30 deletions(-)
  create mode 100644 src/event/quic/ngx_event_quic_bbr.c
  create mode 100644 src/event/quic/ngx_event_quic_bbr.h
  create mode 100644 src/event/quic/ngx_event_quic_brutal.c
@@ -512,10 +512,10 @@ index abd3f7ade..7b45ca160 100644
      }
 diff --git a/src/event/quic/ngx_event_quic_bbr.c b/src/event/quic/ngx_event_quic_bbr.c
 new file mode 100644
-index 000000000..4396382f4
+index 000000000..4b09f8503
 --- /dev/null
 +++ b/src/event/quic/ngx_event_quic_bbr.c
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1122 @@
 +/*
 + * Copyright (C) Nginx, Inc.
 + */
@@ -552,12 +552,26 @@ index 000000000..4396382f4
 +} ngx_quic_bbr_recovery_e;
 +
 +
++/* Kathleen Nichols windowed max filter: maintains best/2nd/3rd estimates
++ * over a fixed window of rounds, with automatic expiry */
++typedef struct {
++    uint64_t  sample;
++    uint64_t  time;
++} ngx_quic_bbr_filter_est_t;
++
++
++typedef struct {
++    uint64_t                 window_length;
++    ngx_quic_bbr_filter_est_t est[3];
++} ngx_quic_bbr_max_filter_t;
++
++
 +typedef struct {
 +    ngx_uint_t                       mode;
 +    ngx_uint_t                       profile;
 +    ngx_uint_t                       recovery_state;
 +
-+    uint64_t                         bw_filter[NGX_QUIC_BBR_BW_WINDOW];
++    ngx_quic_bbr_max_filter_t        max_bw_filter;
 +    uint64_t                         max_bw;
 +    uint64_t                         full_bw;
 +    uint64_t                         pacing_rate;
@@ -670,6 +684,12 @@ index 000000000..4396382f4
 +    size_t new_size);
 +static size_t ngx_quic_bbr_clamp_cwnd(ngx_quic_bbr_t *bbr, size_t cwnd);
 +static size_t ngx_quic_bbr_add_window(size_t a, size_t b);
++
++static void ngx_quic_bbr_filter_reset(ngx_quic_bbr_max_filter_t *f,
++    uint64_t sample, uint64_t time);
++static void ngx_quic_bbr_filter_update(ngx_quic_bbr_max_filter_t *f,
++    uint64_t sample, uint64_t time);
++static uint64_t ngx_quic_bbr_filter_best(ngx_quic_bbr_max_filter_t *f);
 +
 +
 +const ngx_quic_cc_ops_t  ngx_quic_bbr_ops = {
@@ -898,6 +918,8 @@ index 000000000..4396382f4
 +
 +    ngx_memzero(bbr, sizeof(ngx_quic_bbr_t));
 +
++    bbr->max_bw_filter.window_length = NGX_QUIC_BBR_BW_WINDOW;
++
 +    ngx_quic_cc_reset_default(c);
 +    ngx_quic_bbr_set_profile(c, bbr);
 +
@@ -914,8 +936,9 @@ index 000000000..4396382f4
 +    bbr->cwnd = bbr->initial_cwnd;
 +    bbr->recovery_window = bbr->max_cwnd;
 +    bbr->cwnd_to_calculate_min_pacing_rate = bbr->initial_cwnd;
-+    bbr->pacing_rate = NGX_QUIC_BBR_MIN_BW * bbr->high_gain
-+                       / NGX_QUIC_BBR_SCALE;
++    /* initial pacing from initial_cwnd / 100ms * high_gain, matching quic-go BBR */
++    bbr->pacing_rate = (uint64_t) bbr->initial_cwnd * 10
++                       * bbr->high_gain / NGX_QUIC_BBR_SCALE;
 +
 +    ngx_quic_bbr_enter_startup(bbr);
 +
@@ -976,44 +999,102 @@ index 000000000..4396382f4
 +}
 +
 +
++static void
++ngx_quic_bbr_filter_reset(ngx_quic_bbr_max_filter_t *f, uint64_t sample,
++    uint64_t time)
++{
++    f->est[2].sample = sample;
++    f->est[2].time = time;
++    f->est[1] = f->est[2];
++    f->est[0] = f->est[1];
++}
++
++
++static void
++ngx_quic_bbr_filter_update(ngx_quic_bbr_max_filter_t *f, uint64_t sample,
++    uint64_t time)
++{
++    /* uninitialized, new best, or oldest estimate expired → reset all */
++    if (f->est[0].sample == 0
++        || sample >= f->est[0].sample
++        || time - f->est[2].time > f->window_length)
++    {
++        ngx_quic_bbr_filter_reset(f, sample, time);
++        return;
++    }
++
++    if (sample >= f->est[1].sample) {
++        f->est[1].sample = sample;
++        f->est[1].time = time;
++        f->est[2] = f->est[1];
++
++    } else if (sample >= f->est[2].sample) {
++        f->est[2].sample = sample;
++        f->est[2].time = time;
++    }
++
++    /* expire best estimate after a full window */
++    if (time - f->est[0].time > f->window_length) {
++        f->est[0] = f->est[1];
++        f->est[1] = f->est[2];
++        f->est[2].sample = sample;
++        f->est[2].time = time;
++
++        if (time - f->est[0].time > f->window_length) {
++            f->est[0] = f->est[1];
++            f->est[1] = f->est[2];
++        }
++        return;
++    }
++
++    /* second-best: take from 2nd quarter of window if no better sample */
++    if (f->est[1].sample == f->est[0].sample
++        && time - f->est[1].time > f->window_length / 4)
++    {
++        f->est[1].sample = sample;
++        f->est[1].time = time;
++        f->est[2] = f->est[1];
++        return;
++    }
++
++    /* third-best: take from 2nd half of window if no better sample */
++    if (f->est[2].sample == f->est[1].sample
++        && time - f->est[2].time > f->window_length / 2)
++    {
++        f->est[2].sample = sample;
++        f->est[2].time = time;
++    }
++}
++
++
++static uint64_t
++ngx_quic_bbr_filter_best(ngx_quic_bbr_max_filter_t *f)
++{
++    return f->est[0].sample;
++}
++
++
 +static uint64_t
 +ngx_quic_bbr_max_bw(ngx_quic_bbr_t *bbr)
 +{
-+    uint64_t    max;
-+    ngx_uint_t  i;
-+
-+    max = 0;
-+
-+    for (i = 0; i < NGX_QUIC_BBR_BW_WINDOW; i++) {
-+        max = ngx_max(max, bbr->bw_filter[i]);
-+    }
-+
-+    return max;
++    return ngx_quic_bbr_filter_best(&bbr->max_bw_filter);
 +}
 +
 +
 +static ngx_uint_t
 +ngx_quic_bbr_update_bw(ngx_quic_bbr_t *bbr, ngx_quic_sample_t *sample)
 +{
-+    uint64_t    old;
-+    ngx_uint_t  slot;
++    uint64_t  old;
 +
 +    if (sample->delivery_rate == 0) {
 +        return 0;
 +    }
 +
 +    old = bbr->max_bw;
-+    slot = bbr->round_count % NGX_QUIC_BBR_BW_WINDOW;
-+
-+    if (sample->round_start) {
-+        bbr->bw_filter[slot] = sample->delivery_rate;
-+
-+    } else {
-+        bbr->bw_filter[slot] = ngx_max(bbr->bw_filter[slot],
-+                                       sample->delivery_rate);
-+    }
 +
 +    if (!sample->sample_is_app_limited || sample->delivery_rate >= old) {
++        ngx_quic_bbr_filter_update(&bbr->max_bw_filter,
++                                   sample->delivery_rate, bbr->round_count);
 +        bbr->max_bw = ngx_quic_bbr_max_bw(bbr);
 +    }
 +
@@ -2905,10 +2986,10 @@ index f98c834a1..e5c7e6706 100644
      } else {
 diff --git a/src/event/quic/ngx_event_quic_sampler.c b/src/event/quic/ngx_event_quic_sampler.c
 new file mode 100644
-index 000000000..20e77f45d
+index 000000000..7597c04de
 --- /dev/null
 +++ b/src/event/quic/ngx_event_quic_sampler.c
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,488 @@
 +/*
 + * Copyright (C) Nginx, Inc.
 + */
@@ -3257,7 +3338,24 @@ index 000000000..20e77f45d
 +    sampler->total_bytes_acked_after_last_event = sampler->total_bytes_acked;
 +
 +    if (sampler->reduce_extra_acked_on_bw_increase && is_new_max) {
-+        ngx_quic_sampler_reset_ack_height(c, round);
++        uint64_t             recal_expected;
++        ngx_uint_t           idx;
++        ngx_quic_ack_height_t *h;
++
++        for (idx = 0; idx < NGX_QUIC_ACK_HEIGHT_WINDOW; idx++) {
++            h = &sampler->ack_height_filter[idx];
++            if (h->extra_acked == 0) {
++                continue;
++            }
++
++            recal_expected = ngx_quic_sampler_mul_div(bandwidth, h->delta, 1000);
++
++            if (recal_expected < h->bytes_acked) {
++                h->extra_acked = h->bytes_acked - recal_expected;
++            } else {
++                ngx_memzero(h, sizeof(ngx_quic_ack_height_t));
++            }
++        }
 +    }
 +
 +    if (!sampler->ack_epoch_started) {
