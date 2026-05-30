@@ -31,11 +31,6 @@ ARG PKG_CONFIG_HOME="/usr/src/pkgs"
 ARG PKG_CONFIG_LIB_DIR="lib"
 ARG PKG_CONFIG_PATH="${PKG_CONFIG_HOME}/${PKG_CONFIG_LIB_DIR}/pkgconfig"
 
-# https://nginx.org/en/pgp_keys.html
-# 'D6786CE303D9A9022998DC6CC8464D549AF75C0A' # Sergey Kandaurov <s.kandaurov@f5.com>
-# '13C82A63B603576156E30A4EA0EA981B66B0D967' # Konstantin Pavlov <thresh@nginx.com>
-# ARG GPG_KEYS=D6786CE303D9A9022998DC6CC8464D549AF75C0A
-
 # https://github.com/nginx/ci-self-hosted/blob/main/.github/workflows/nginx-buildbot.yml
 
 ARG NGINX_BASE_CONFIG="\
@@ -54,6 +49,7 @@ ARG NGINX_BASE_CONFIG="\
 	"
 
 ARG NGINX_CORE_MODULES="\
+#		--with-http_acme_module \
 		--with-http_auth_request_module \
 		--with-http_sub_module \
 		--with-http_gunzip_module \
@@ -66,6 +62,7 @@ ARG NGINX_CORE_MODULES="\
 		--with-http_ssl_module \
 		--with-http_realip_module \
 		--with-stream \
+#		--with-stream_acme_module \
 		--with-stream_ssl_module \
 		--with-stream_ssl_preread_module \
 		--with-stream_realip_module \
@@ -136,7 +133,7 @@ RUN set -eux; \
 #################################################################################################
 
 RUN set -eux; \
-	git clone --recurse-submodules https://github.com/nginx/nginx /usr/src/nginx; \
+	git clone --recurse-submodules https://github.com/webserver-llc/angie /usr/src/nginx; \
 	cd /usr/src/nginx; \
 	git checkout --force --quiet ${NGINX_COMMIT_ID}; \
 	git submodule update --init --recursive;
@@ -168,17 +165,17 @@ RUN set -eux; \
 ### ngx_http_zstd_static_module.so;
 ### ngx_http_zstd_filter_module.so;
 
-#RUN set -eux; \
-#	git clone --recurse-submodules https://github.com/tokers/zstd-nginx-module /usr/src/zstd-nginx-module; \
-#	cd /usr/src/zstd-nginx-module; \
-#	git checkout --force --quiet ${NGX_ZSTD_COMMIT_ID}; \
-#	git submodule update --init --recursive;
-
 RUN set -eux; \
-	git clone --recurse-submodules https://github.com/HanadaLee/ngx_http_zstd_module /usr/src/zstd-nginx-module; \
+	git clone --recurse-submodules https://github.com/tokers/zstd-nginx-module /usr/src/zstd-nginx-module; \
 	cd /usr/src/zstd-nginx-module; \
-	git checkout --force --quiet ${NGX_ZSTD_LEE_COMMIT_ID}; \
+	git checkout --force --quiet ${NGX_ZSTD_COMMIT_ID}; \
 	git submodule update --init --recursive;
+
+#RUN set -eux; \
+#	git clone --recurse-submodules https://github.com/HanadaLee/ngx_http_zstd_module /usr/src/zstd-nginx-module; \
+#	cd /usr/src/zstd-nginx-module; \
+#	git checkout --force --quiet ${NGX_ZSTD_LEE_COMMIT_ID}; \
+#	git submodule update --init --recursive;
 
 #################################################################################################
 ### ngx_http_geoip2_module.so
@@ -212,7 +209,7 @@ RUN set -eux; \
 RUN set -eux; \
 	cd /usr/src/nginx; \
 	./auto/configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_WITHOUT_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
-	--build="Nginx With Dynamic Modules[SSL Static]" \
+	--build="Nginx(Angie) With Dynamic Modules[SSL Static]" \
 	--with-cc=c++ \
 	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include -x c" \
 	--with-ld-opt="${NGINX_LD_OPT} ${NGINX_LD_OPT_EXT_NO_ERROR} -L/usr/boringssl/lib"; \
@@ -266,10 +263,10 @@ ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
 LABEL \
-	description="Nginx Docker Build with BoringSSL" \
+	description="Nginx(Angie) Docker Build with BoringSSL" \
 	maintainer="Custom Auto Build" \
 	openssl="BoringSSL (${BORINGSSL_COMMIT_ID})" \
-	nginx="Nginx (${NGINX_COMMIT_ID})"
+	nginx="Nginx(Angie) (${NGINX_COMMIT_ID})"
 
 # 定义容器暴露的端口
 # EXPOSE 80 443

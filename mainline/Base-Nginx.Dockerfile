@@ -16,8 +16,6 @@ ARG NGX_ZSTD_LEE_COMMIT_ID="HEAD~0"
 ARG NGX_GEOIP2_COMMIT_ID="HEAD~0"
 ARG NGX_HEADERS_MORE_COMMIT_ID="HEAD~0"
 
-ARG NGX_TCP_BRUTAL_COMMIT_ID="HEAD~0"
-
 ARG NJS_COMMIT_ID="HEAD~0"
 ARG QUICKJS_COMMIT_ID="HEAD~0"
 ARG QUICKJS_NG_COMMIT_ID="HEAD~0"
@@ -55,27 +53,18 @@ ARG NGINX_BASE_CONFIG="\
 		--lock-path=/var/run/nginx.lock \
 		--http-client-body-temp-path=/var/cache/nginx/client_temp \
 		--http-proxy-temp-path=/var/cache/nginx/proxy_temp \
-		--http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
-		--http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
-		--http-scgi-temp-path=/var/cache/nginx/scgi_temp \
 		--with-perl_modules_path=/usr/lib/perl5/vendor_perl \
 		--user=nginx \
 		--group=nginx \
 	"
 
 ARG NGINX_CORE_MODULES="\
-		--with-http_addition_module \
 		--with-http_auth_request_module \
 		--with-http_sub_module \
-		--with-http_dav_module \
-		--with-http_flv_module \
-		--with-http_mp4_module \
 		--with-http_gunzip_module \
 		--with-http_gzip_static_module \
-		--with-http_random_index_module \
 		--with-http_secure_link_module \
 		--with-http_stub_status_module \
-		--with-http_degradation_module \
 		--with-http_slice_module \
 		--with-http_v2_module \
 		--with-http_v3_module \
@@ -90,12 +79,18 @@ ARG NGINX_CORE_MODULES="\
 		--with-file-aio \
 	"
 
+ARG NGINX_WITHOUT_MODULES="\
+		--without-http_ssi_module \
+		--without-http_scgi_module \
+		--without-http_uwsgi_module \
+		--without-http_fastcgi_module \
+		--without-http_memcached_module \
+	"
+
 ARG NGINX_DYNAMIC_MODULES="\
-		--with-mail=dynamic \
-		--with-mail_ssl_module \
-		--with-http_xslt_module=dynamic \
+#		--with-mail=dynamic \
+#		--with-mail_ssl_module \
 		--with-http_perl_module=dynamic \
-		--with-http_image_filter_module=dynamic \
 	"
 
 ARG NGINX_DYNAMIC_MODULES_EXTERNAL="\
@@ -155,8 +150,7 @@ RUN set -eux; \
 	git checkout --force --quiet ${NGINX_COMMIT_ID}; \
 	git submodule update --init --recursive;
 
-# ECH BoringSSL 补丁
-# H3 BBR 补丁
+# 补丁
 COPY patch/${NGINX_PATCH_LIBS}/* /opt/build/patch/
 
 RUN set -eux; \
@@ -264,7 +258,7 @@ RUN set -eux; \
 # 分开编译会导致部分模块加载异常(例如ngx_http_perl_module)
 RUN set -eux; \
 	cd /usr/src/nginx; \
-	./auto/configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
+	./auto/configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_WITHOUT_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
 	--build="Nginx With Dynamic Modules[SSL Shared]" \
 	--with-cc=c++ \
 	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include ${QJS_CC_OPT} -x c" \
