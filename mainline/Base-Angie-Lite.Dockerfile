@@ -208,7 +208,7 @@ RUN set -eux; \
 # 分开编译会导致部分模块加载异常(例如ngx_http_perl_module)
 RUN set -eux; \
 	cd /usr/src/nginx; \
-	./auto/configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_WITHOUT_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
+	./configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_WITHOUT_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
 	--build="Nginx(Angie) With Dynamic Modules[SSL Static]" \
 	--with-cc=c++ \
 	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include -x c" \
