@@ -22,6 +22,12 @@ ARG QUICKJS_NG_COMMIT_ID="HEAD~0"
 
 # nginx:alpine nginx -V
 
+ARG NGINX_MODULES_PATH="/usr/lib/nginx/modules"
+
+ARG PKG_CONFIG_HOME="/usr/src/pkgs"
+ARG PKG_CONFIG_LIB_DIR="lib"
+ARG PKG_CONFIG_PATH="${PKG_CONFIG_HOME}/${PKG_CONFIG_LIB_DIR}/pkgconfig"
+
 ARG NGINX_CC_OPT="-O2 -fstack-protector-strong -fstack-clash-protection -fno-plt -Wformat -Werror=format-security -pipe -fno-semantic-interposition -fno-strict-aliasing -fomit-frame-pointer"
 ARG NGINX_LD_OPT="-Wl,-O2 -Wl,--as-needed -Wl,--sort-common -Wl,-z,now -Wl,-z,relro -Wl,-z,pack-relative-relocs -Wl,--hash-style=gnu -Wl,--strip-all"
 
@@ -29,17 +35,7 @@ ARG NGINX_LD_OPT="-Wl,-O2 -Wl,--as-needed -Wl,--sort-common -Wl,-z,now -Wl,-z,re
 ARG NGINX_CC_OPT_EXT_NO_ERROR=""
 ARG NGINX_LD_OPT_EXT_NO_ERROR=""
 
-ARG NGINX_MODULES_PATH="/usr/lib/nginx/modules"
-
-ARG PKG_CONFIG_HOME="/usr/src/pkgs"
-ARG PKG_CONFIG_LIB_DIR="lib"
-ARG PKG_CONFIG_PATH="${PKG_CONFIG_HOME}/${PKG_CONFIG_LIB_DIR}/pkgconfig"
-
 # https://nginx.org/en/pgp_keys.html
-# 'D6786CE303D9A9022998DC6CC8464D549AF75C0A' # Sergey Kandaurov <s.kandaurov@f5.com>
-# '13C82A63B603576156E30A4EA0EA981B66B0D967' # Konstantin Pavlov <thresh@nginx.com>
-# ARG GPG_KEYS=D6786CE303D9A9022998DC6CC8464D549AF75C0A
-
 # https://github.com/nginx/ci-self-hosted/blob/main/.github/workflows/nginx-buildbot.yml
 
 ARG NGINX_BASE_CONFIG="\
@@ -101,8 +97,6 @@ ARG NGINX_DYNAMIC_MODULES_EXTERNAL="\
 		--add-dynamic-module=/usr/src/njs/nginx \
 	"
 
-# gnupg 仅在验证 GPG 签名时需要
-
 RUN set -eux; \
 	###【alpine】
 	# addgroup -S nginx; \
@@ -115,32 +109,54 @@ RUN set -eux; \
 	apt-get update; \
 	DEBIAN_FRONTEND=noninteractive \
 	apt-get install -y --no-install-recommends \
+		tzdata \
 		ca-certificates \
+		lsb-release \
+		gnupg \
 		tzdata \
 		tree \
 		git \
+		wget \
+		curl \
 		make \
 		cmake \
 		ninja-build \
 		meson \
 		libtool \
 		bash \
-		zstd \
 		7zip \
 		unzip \
 		pkg-config \
 		build-essential \
-		libgd-dev \
-		libgd-tools \
+		libzstd-dev \
+		zlib1g-dev \
+		libpcre2-dev \
+		libperl-dev \
 		libmaxminddb-dev \
 		libxslt-dev \
 		libxml2-dev \
-		libpcre2-dev \
-		zlib1g-dev \
-		libperl-dev \
+		libgd-dev \
+		libgd-tools \
 		; \
 	rm -rf /var/lib/apt/lists/*; \
 	mkdir -p /usr/src;
+
+#################################################################################################
+
+### 安装 Clang 22
+RUN set -eux; \
+	mkdir -p /opt/clang; \
+	cd /opt/clang; \
+    wget -qO llvm.sh https://apt.llvm.org/llvm.sh; \
+    chmod +x llvm.sh; \
+    ./llvm.sh 22 all; \
+	# 创建符号链接，以便 CMake 能找到 clang/clang++
+    ln -sf /usr/bin/clang-22 /usr/local/bin/clang; \
+    ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
+	ln -sf /usr/bin/lld-22 /usr/local/bin/lld;
+
+ENV CC=clang
+ENV CXX=clang++
 
 #################################################################################################
 
@@ -260,9 +276,9 @@ RUN set -eux; \
 	cd /usr/src/nginx; \
 	./auto/configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_WITHOUT_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
 	--build="Nginx With Dynamic Modules[SSL Shared]" \
-	--with-cc=c++ \
-	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include ${QJS_CC_OPT} -x c" \
-	--with-ld-opt="${NGINX_LD_OPT} ${NGINX_LD_OPT_EXT_NO_ERROR} -L/usr/boringssl/lib ${QJS_LD_OPT}"; \
+	--with-cc=clang \
+	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include ${QJS_CC_OPT}" \
+	--with-ld-opt="${NGINX_LD_OPT} ${NGINX_LD_OPT_EXT_NO_ERROR} -L/usr/boringssl/lib ${QJS_LD_OPT} -lstdc++"; \
 	make -j"$(nproc)"; \
 	make install;
 

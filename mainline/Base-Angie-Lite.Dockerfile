@@ -1,4 +1,4 @@
-ARG BASE_IMAGE="gcc:15-trixie"
+ARG BASE_IMAGE="debian:trixie-slim"
 
 FROM ${BASE_IMAGE} AS builder
 
@@ -18,6 +18,12 @@ ARG NGX_HEADERS_MORE_COMMIT_ID="HEAD~0"
 
 # nginx:alpine nginx -V
 
+ARG NGINX_MODULES_PATH="/usr/lib/nginx/modules"
+
+ARG PKG_CONFIG_HOME="/usr/src/pkgs"
+ARG PKG_CONFIG_LIB_DIR="lib"
+ARG PKG_CONFIG_PATH="${PKG_CONFIG_HOME}/${PKG_CONFIG_LIB_DIR}/pkgconfig"
+
 ARG NGINX_CC_OPT="-O2 -fstack-protector-strong -fstack-clash-protection -fno-plt -Wformat -Werror=format-security -pipe -fno-semantic-interposition -fno-strict-aliasing -fomit-frame-pointer"
 ARG NGINX_LD_OPT="-Wl,-O2 -Wl,--as-needed -Wl,--sort-common -Wl,-z,now -Wl,-z,relro -Wl,-z,pack-relative-relocs -Wl,--hash-style=gnu -Wl,--strip-all"
 
@@ -25,12 +31,7 @@ ARG NGINX_LD_OPT="-Wl,-O2 -Wl,--as-needed -Wl,--sort-common -Wl,-z,now -Wl,-z,re
 ARG NGINX_CC_OPT_EXT_NO_ERROR=""
 ARG NGINX_LD_OPT_EXT_NO_ERROR=""
 
-ARG NGINX_MODULES_PATH="/usr/lib/nginx/modules"
-
-ARG PKG_CONFIG_HOME="/usr/src/pkgs"
-ARG PKG_CONFIG_LIB_DIR="lib"
-ARG PKG_CONFIG_PATH="${PKG_CONFIG_HOME}/${PKG_CONFIG_LIB_DIR}/pkgconfig"
-
+# https://nginx.org/en/pgp_keys.html
 # https://github.com/nginx/ci-self-hosted/blob/main/.github/workflows/nginx-buildbot.yml
 
 ARG NGINX_BASE_CONFIG="\
@@ -89,8 +90,6 @@ ARG NGINX_DYNAMIC_MODULES_EXTERNAL="\
 		--add-dynamic-module=/usr/src/headers-more-nginx-module \
 	"
 
-# gnupg 仅在验证 GPG 签名时需要
-
 RUN set -eux; \
 	###【alpine】
 	# addgroup -S nginx; \
@@ -103,32 +102,53 @@ RUN set -eux; \
 	apt-get update; \
 	DEBIAN_FRONTEND=noninteractive \
 	apt-get install -y --no-install-recommends \
+		tzdata \
 		ca-certificates \
+		lsb-release \
+		gnupg \
 		tzdata \
 		tree \
 		git \
+		wget \
+		curl \
 		make \
 		cmake \
 		ninja-build \
 		meson \
 		libtool \
 		bash \
-		zstd \
 		7zip \
 		unzip \
 		pkg-config \
 		build-essential \
-		libgd-dev \
-		libgd-tools \
+		libzstd-dev \
+		zlib1g-dev \
+		libpcre2-dev \
 		libmaxminddb-dev \
 		libxslt-dev \
 		libxml2-dev \
-		libpcre2-dev \
-		zlib1g-dev \
-		libperl-dev \
+		libgd-dev \
+		libgd-tools \
 		; \
 	rm -rf /var/lib/apt/lists/*; \
 	mkdir -p /usr/src;
+
+#################################################################################################
+
+### 安装 Clang 22
+RUN set -eux; \
+	mkdir -p /opt/clang; \
+	cd /opt/clang; \
+    wget -qO llvm.sh https://apt.llvm.org/llvm.sh; \
+    chmod +x llvm.sh; \
+    ./llvm.sh 22 all; \
+	# 创建符号链接，以便 CMake 能找到 clang/clang++
+    ln -sf /usr/bin/clang-22 /usr/local/bin/clang; \
+    ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
+	ln -sf /usr/bin/lld-22 /usr/local/bin/lld;
+
+ENV CC=clang
+ENV CXX=clang++
 
 #################################################################################################
 
@@ -210,9 +230,9 @@ RUN set -eux; \
 	cd /usr/src/nginx; \
 	./configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_WITHOUT_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
 	--build="Nginx(Angie) With Dynamic Modules[SSL Static]" \
-	--with-cc=c++ \
-	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include -x c" \
-	--with-ld-opt="${NGINX_LD_OPT} ${NGINX_LD_OPT_EXT_NO_ERROR} -L/usr/boringssl/lib"; \
+	--with-cc=clang \
+	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include" \
+	--with-ld-opt="${NGINX_LD_OPT} ${NGINX_LD_OPT_EXT_NO_ERROR} -L/usr/boringssl/lib -lstdc++"; \
 	make -j"$(nproc)"; \
 	make install;
 
@@ -221,8 +241,8 @@ RUN set -eux; \
 	mkdir /etc/nginx/http.d/; \
 	mkdir /etc/nginx/stream.d/; \
 	mkdir -p /usr/share/nginx/html/; \
-	install -m644 docs/html/index.html /usr/share/nginx/html/; \
-	install -m644 docs/html/50x.html /usr/share/nginx/html/;
+	install -m644 html/index.html /usr/share/nginx/html/; \
+	install -m644 html/50x.html /usr/share/nginx/html/;
 
 # 精简运行文件
 RUN set -eux; \
@@ -263,7 +283,7 @@ ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
 LABEL \
-	description="Nginx(Angie) Docker Build with BoringSSL" \
+	description="Nginx(Angie) Docker Build with BoringSSL(Static)" \
 	maintainer="Custom Auto Build" \
 	openssl="BoringSSL (${BORINGSSL_COMMIT_ID})" \
 	nginx="Nginx(Angie) (${NGINX_COMMIT_ID})"
