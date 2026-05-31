@@ -11,7 +11,6 @@ RUN set -eux; \
 		ca-certificates \
 		lsb-release \
 		gnupg \
-		tzdata \
 		tree \
 		git \
 		wget \
@@ -92,7 +91,7 @@ ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
 LABEL \
-	description="Optimized BoringSSL for NGINX with GCC 15" \
+	description="Optimized BoringSSL with Clang(22)" \
 	maintainer="Custom Auto Build" \
 	openssl="BoringSSL (${BORINGSSL_COMMIT_ID})"
 

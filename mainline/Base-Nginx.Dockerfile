@@ -113,7 +113,6 @@ RUN set -eux; \
 		ca-certificates \
 		lsb-release \
 		gnupg \
-		tzdata \
 		tree \
 		git \
 		wget \
