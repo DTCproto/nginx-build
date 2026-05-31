@@ -12,7 +12,7 @@ on:
       ssl_commit_id:
         description: "指定BoringSSL使用commit id版本"
         required: true
-        default: "0.20260508.0"
+        default: "0.20260526.0"
         type: string
       nginx_patch_libs:
         description: "use nginx patch libs"
