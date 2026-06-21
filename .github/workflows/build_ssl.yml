@@ -1,7 +1,6 @@
-name: BUILD_BORINGSSL(V3)
+name: BUILD_BORINGSSL(V3.5)
 
 on:
-  # you may only define up to 10 `inputs` for a `workflow_dispatch` event
   workflow_dispatch:
     inputs:
       ssl_commit_id:
@@ -10,11 +9,11 @@ on:
         default: "0.20260616.0"
         type: string
       build_ssl_static:
-        description: "enable ssl build"
+        description: "enable ssl static build"
         default: true
         type: boolean
-      build_ssl:
-        description: "enable ssl build"
+      build_ssl_share:
+        description: "enable ssl share build"
         default: true
         type: boolean
       release_archives:
@@ -23,6 +22,7 @@ on:
         type: boolean
 
 jobs:
+  # ── 参数准备（公共前置） ──────────────────────────────────────────
   pre:
     runs-on: ubuntu-latest
     permissions:
@@ -50,135 +50,44 @@ jobs:
           ACTOR: '${{ github.actor }}'
           REPOSITORY: '${{ github.repository }}'
 
-  build-base:
-    runs-on: ubuntu-latest
+  # ── 静态库构建（独立机器，与 shared 并行） ────────────────────────
+  build-ssl-static:
+    if: ${{ inputs.build_ssl_static }}
     needs: [pre]
     permissions:
       contents: write
       packages: write
       attestations: write
       id-token: write
-    # 同一个标签，不能多次push，会强制清空覆盖所有数据
-    # strategy:
-    #   matrix:
-    #     os: [linux/amd64, linux/arm64]
-    steps:
-      #- name: Free Disk-Space
-      #  run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc && df -h
+    uses: ./.github/workflows/build-ssl-callable.yml
+    with:
+      ssl_commit_id: ${{ inputs.ssl_commit_id }}
+      build_shared_libs: "0"
+      release_archives: ${{ inputs.release_archives }}
+      tag_suffix: "boringssl-static"
+      dockerfile: "mainline/Base-BoringSSL.Dockerfile"
+      actor_lc: ${{ needs.pre.outputs.ACTOR_LC }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: (Before)Free Disk-Space
-        run: df -h
-
-      - name: Free Disk Space
-        uses: endersonmenezes/free-disk-space@v3  # Use @main for latest, @v3 for stable
-        with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-          remove_swap: true
-          #remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
-          remove_packages_one_command: true
-          #remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
-          rm_cmd: "rmz"  # Use 'rmz' for faster deletion (default: 'rm')
-          #rmz_version: "3.1.1"  # Required when rm_cmd is 'rmz'
-          testing: false
-
-      - name: (After)Free Disk-Space
-        run: df -h
-
-      - uses: actions/checkout@v7
-        with:
-          submodules: 'true'
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-        with:
-          image: tonistiigi/binfmt:qemu-v10.2.1
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Install System Tools
-        run: |
-          sudo apt install -y git curl wget tree subversion
-
-      - name: init
-        run: |
-          mkdir -p ${{ github.workspace }}/mainline/conf/
-          cp -rf ${{ github.workspace }}/conf/* ${{ github.workspace }}/mainline/conf/
-          mkdir -p ${{ github.workspace }}/mainline/patch/
-          cp -rf ${{ github.workspace }}/patch/* ${{ github.workspace }}/mainline/patch/
-          mkdir -p ${{ github.workspace }}/mainline/tools/
-          cp -rf ${{ github.workspace }}/tools/* ${{ github.workspace }}/mainline/tools/
-          tree ${{ github.workspace }}/mainline/
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      
-      - name: Login to the Container registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # 自动标签
-      #- name: Extract metadata (tags, labels) for Docker
-      #  id: meta
-      #  uses: docker/metadata-action@v5
-      #  with:
-      #    images: |
-      #      ${{ secrets.DOCKERHUB_USERNAME }}/nginx
-      #      ghcr.io/${{ github.repository }}
-
-      - name: Build And Push (static)[SSL]
-        if: ${{ inputs.build_ssl_static }}
-        uses: docker/build-push-action@v7
-        with:
-          context: ${{ github.workspace }}/mainline/
-          file: ${{ github.workspace }}/mainline/Base-BoringSSL.Dockerfile
-          platforms: |
-            linux/amd64
-            linux/arm64
-          build-args: |
-            BUILD_SHARED_LIBS=0
-            BORINGSSL_COMMIT_ID=${{ inputs.ssl_commit_id }}
-          push: ${{ inputs.release_archives }}
-          provenance: false
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/base-ssl:${{ inputs.ssl_commit_id }}-boringssl-static
-            ${{ secrets.DOCKERHUB_USERNAME }}/base-ssl:boringssl-static-latest
-            ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:${{ inputs.ssl_commit_id }}-boringssl-static
-            ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:boringssl-static-latest
-          #cache-from: type=registry,ref=ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:buildcache-static
-          #cache-to: type=registry,ref=ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:buildcache-static,mode=max
-          # 完全禁用缓存(二选一)
-          no-cache: true
-
-      - name: Build And Push (share)[SSL]
-        if: ${{ inputs.build_ssl }}
-        uses: docker/build-push-action@v7
-        with:
-          context: ${{ github.workspace }}/mainline/
-          file: ${{ github.workspace }}/mainline/Base-BoringSSL.Dockerfile
-          platforms: |
-            linux/amd64
-            linux/arm64
-          build-args: |
-            BUILD_SHARED_LIBS=1
-            BORINGSSL_COMMIT_ID=${{ inputs.ssl_commit_id }}
-          push: ${{ inputs.release_archives }}
-          provenance: false
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/base-ssl:${{ inputs.ssl_commit_id }}-boringssl
-            ${{ secrets.DOCKERHUB_USERNAME }}/base-ssl:boringssl-latest
-            ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:${{ inputs.ssl_commit_id }}-boringssl
-            ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:boringssl-latest
-          #cache-from: type=registry,ref=ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:buildcache
-          #cache-to: type=registry,ref=ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/base-ssl:buildcache,mode=max
-          # 完全禁用缓存(二选一)
-          no-cache: true
+  # ── 共享库构建（独立机器，与 static 并行） ────────────────────────
+  build-ssl-shared:
+    if: ${{ inputs.build_ssl_share }}
+    needs: [pre]
+    permissions:
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/build-ssl-callable.yml
+    with:
+      ssl_commit_id: ${{ inputs.ssl_commit_id }}
+      build_shared_libs: "1"
+      release_archives: ${{ inputs.release_archives }}
+      tag_suffix: "boringssl"
+      dockerfile: "mainline/Base-BoringSSL.Dockerfile"
+      actor_lc: ${{ needs.pre.outputs.ACTOR_LC }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
