@@ -7,12 +7,12 @@ on:
       nginx_commit_id:
         description: "指定nginx(angie)使用commit id版本"
         required: true
-        default: "Angie-1.11.6"
+        default: "Angie-1.11.8"
         type: string
       ssl_commit_id:
         description: "指定BoringSSL使用commit id版本"
         required: true
-        default: "0.20260526.0"
+        default: "0.20260616.0"
         type: string
       nginx_patch_libs:
         description: "use nginx patch libs"
@@ -45,11 +45,13 @@ jobs:
       default_commit_id: HEAD~0
       default_branch: ${{ steps.set_global_params.outputs.default_branch }}
       ngx_brotli_commit_id: "a71f9312c2deb28875acc7bacfdd5695a111aa53"
+      brotli_lib_commit_id: "v1.2.0"
       ngx_zstd_commit_id: "057a7d339af1111d04b5a9ac5ae9b0250d17cd94"
       ngx_zstd_lee_commit_id: "09ce44eb68bccaa855206f7316fa0219a54bea3f"
-      ngx_headers_more_commit_id: "v0.39"
-      njs_commit_id: "0.9.8"
-      quickjs_commit_id: "d7ae12ae71dfd6ab2997527d295014a8996fa0f9"
+      ngx_geoip2_commit_id: "445df24ef3781e488cee3dfe8a1e111997fc1dfe"
+      ngx_headers_more_commit_id: "v0.40"
+      njs_commit_id: "0.9.9"
+      quickjs_commit_id: "04be246001599f5995fa2f2d8c91a0f198d3f34c"
       quickjs_ng_commit_id: "v0.11.0"
       ACTOR_LC: ${{ steps.set_case_params.outputs.ACTOR_LC }}
       REPOSITORY_LC: ${{ steps.set_case_params.outputs.REPOSITORY_LC }}
@@ -167,8 +169,10 @@ jobs:
             BORINGSSL_COMMIT_ID=${{ inputs.ssl_commit_id }}
             NGINX_PATCH_LIBS=${{ inputs.nginx_patch_libs }}
             NGX_BROTLI_COMMIT_ID=${{ needs.pre.outputs.ngx_brotli_commit_id }}
+            BROTLI_LIB_COMMIT_ID=${{ needs.pre.outputs.brotli_lib_commit_id }}
             NGX_ZSTD_COMMIT_ID=${{ needs.pre.outputs.ngx_zstd_commit_id }}
             NGX_ZSTD_LEE_COMMIT_ID=${{ needs.pre.outputs.ngx_zstd_lee_commit_id }}
+            NGX_GEOIP2_COMMIT_ID=${{ needs.pre.outputs.ngx_geoip2_commit_id }}
             NGX_HEADERS_MORE_COMMIT_ID=${{ needs.pre.outputs.ngx_headers_more_commit_id }}
             NJS_COMMIT_ID=${{ needs.pre.outputs.njs_commit_id }}
             QUICKJS_COMMIT_ID=${{ needs.pre.outputs.quickjs_commit_id }}

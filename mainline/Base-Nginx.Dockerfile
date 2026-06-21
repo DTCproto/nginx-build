@@ -235,7 +235,7 @@ RUN set -eux; \
 # 	git checkout --force --quiet ${QUICKJS_COMMIT_ID}; \
 # 	git submodule update --init --recursive; \
 # 	mkdir -p build; \
-# 	CFLAGS='-O2 -fPIC' make libquickjs.a;
+# 	CFLAGS="${NGINX_CC_OPT} -fPIC" LDFLAGS="${NGINX_LD_OPT}" make -j$(nproc) libquickjs.a;
 
 ###### cmake
 ### ARG QJS_CC_OPT="-I/usr/src/quickjs"
@@ -249,7 +249,7 @@ RUN set -eux; \
 	cd /usr/src/quickjs; \
 	git checkout --force --quiet ${QUICKJS_NG_COMMIT_ID}; \
 	git submodule update --init --recursive; \
-#	CFLAGS="-O2 -fPIC" cmake -B build; \
+#	CFLAGS="${NGINX_CC_OPT} -fPIC" LDFLAGS="${NGINX_LD_OPT}" cmake -B build; \
 #	cmake --build build --target qjs -j $(nproc);
 	CFLAGS="${NGINX_CC_OPT} -fPIC" LDFLAGS="${NGINX_LD_OPT}" meson setup build --prefix=${PKG_CONFIG_HOME} --libdir=${PKG_CONFIG_LIB_DIR}; \
 	meson compile -C build; \
