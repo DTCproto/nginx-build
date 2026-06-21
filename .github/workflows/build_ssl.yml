@@ -7,7 +7,7 @@ on:
       ssl_commit_id:
         description: "指定BoringSSL使用commit id版本"
         required: true
-        default: "0.20260526.0"
+        default: "0.20260616.0"
         type: string
       build_ssl_static:
         description: "enable ssl build"
