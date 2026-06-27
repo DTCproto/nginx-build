@@ -3,6 +3,14 @@ FROM debian:trixie-slim AS builder
 ARG BORINGSSL_COMMIT_ID="HEAD~0"
 ARG BUILD_SHARED_LIBS="1"
 
+ARG SSL_C_FLAGS="-O3 -flto=thin -fPIC -fno-semantic-interposition -fomit-frame-pointer"
+ARG SSL_LINKER_FLAGS="-fuse-ld=lld -Wl,-O3 -Wl,--lto-O3 -Wl,--gc-sections -Wl,--icf=safe"
+ARG SSL_AR="llvm-ar"
+ARG SSL_RANLIB="llvm-ranlib"
+ARG SSL_NM="llvm-nm"
+
+#################################################################################################
+
 RUN set -eux; \
 	apt-get update; \
 	DEBIAN_FRONTEND=noninteractive \
@@ -40,14 +48,16 @@ RUN set -eux; \
 	cd /opt/clang; \
     wget -qO llvm.sh https://apt.llvm.org/llvm.sh; \
     chmod +x llvm.sh; \
-    ./llvm.sh 22 all; \
-	# 创建符号链接，以便 CMake 能找到 clang/clang++
-    ln -sf /usr/bin/clang-22 /usr/local/bin/clang; \
-    ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
-	ln -sf /usr/bin/lld-22 /usr/local/bin/lld;
+    ./llvm.sh 22 all;
+
+# 将 Clang 22 的 bin 目录置于 PATH 最前面
+ENV PATH="/usr/lib/llvm-22/bin:${PATH}"
 
 ENV CC=clang
 ENV CXX=clang++
+ENV AR=llvm-ar
+ENV RANLIB=llvm-ranlib
+ENV NM=llvm-nm
 
 #################################################################################################
 
@@ -65,8 +75,13 @@ RUN set -eux; \
 		-DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS} \
 		-DCMAKE_C_COMPILER=clang \
     	-DCMAKE_CXX_COMPILER=clang++ \
-		-DCMAKE_C_FLAGS="-O2 -fPIC" \
-		-DCMAKE_CXX_FLAGS="-O2 -fPIC" \
+		-DCMAKE_C_FLAGS="${SSL_C_FLAGS}" \
+		-DCMAKE_CXX_FLAGS="${SSL_C_FLAGS}" \
+		-DCMAKE_EXE_LINKER_FLAGS="${SSL_LINKER_FLAGS}" \
+		-DCMAKE_SHARED_LINKER_FLAGS="${SSL_LINKER_FLAGS}" \
+		-DCMAKE_AR="${SSL_AR}" \
+		-DCMAKE_RANLIB="${SSL_RANLIB}" \
+		-DCMAKE_NM="${SSL_NM}" \
 		-GNinja; \
 	# (二选一)
 	ninja -C /usr/src/boringssl/build;

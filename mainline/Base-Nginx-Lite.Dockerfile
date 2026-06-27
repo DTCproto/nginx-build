@@ -24,8 +24,8 @@ ARG PKG_CONFIG_HOME="/usr/src/pkgs"
 ARG PKG_CONFIG_LIB_DIR="lib"
 ARG PKG_CONFIG_PATH="${PKG_CONFIG_HOME}/${PKG_CONFIG_LIB_DIR}/pkgconfig"
 
-ARG NGINX_CC_OPT="-O2 -fstack-protector-strong -fstack-clash-protection -fno-plt -Wformat -Werror=format-security -pipe -fno-semantic-interposition -fno-strict-aliasing -fomit-frame-pointer"
-ARG NGINX_LD_OPT="-Wl,-O2 -Wl,--sort-common -Wl,-z,now -Wl,-z,relro -Wl,-z,pack-relative-relocs -Wl,--hash-style=gnu -Wl,--strip-all"
+ARG NGINX_CC_OPT="-O3 -flto=thin -fstack-protector-strong -fstack-clash-protection -fno-plt -Wformat -Werror=format-security -pipe -fno-semantic-interposition -fno-strict-aliasing -fomit-frame-pointer"
+ARG NGINX_LD_OPT="-fuse-ld=lld -Wl,-O3 -Wl,--lto-O3 -Wl,--gc-sections -Wl,--icf=safe -Wl,--sort-common -Wl,-z,now -Wl,-z,relro -Wl,-z,pack-relative-relocs -Wl,--hash-style=gnu"
 
 # 临时忽略补丁带来的警告异常
 ARG NGINX_CC_OPT_EXT_NO_ERROR=""
@@ -138,11 +138,10 @@ RUN set -eux; \
 	cd /opt/clang; \
     wget -qO llvm.sh https://apt.llvm.org/llvm.sh; \
     chmod +x llvm.sh; \
-    ./llvm.sh 22 all; \
-	# 创建符号链接，以便 CMake 能找到 clang/clang++
-    ln -sf /usr/bin/clang-22 /usr/local/bin/clang; \
-    ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
-	ln -sf /usr/bin/lld-22 /usr/local/bin/lld;
+    ./llvm.sh 22 all;
+
+# 将 Clang 22 的 bin 目录置于 PATH 最前面
+ENV PATH="/usr/lib/llvm-22/bin:${PATH}"
 
 ENV CC=clang
 ENV CXX=clang++
@@ -243,8 +242,8 @@ RUN set -eux; \
 
 # 精简运行文件
 RUN set -eux; \
-	strip /usr/sbin/nginx; \
-	strip ${NGINX_MODULES_PATH}/*;
+	strip --strip-unneeded /usr/sbin/nginx; \
+	strip --strip-unneeded ${NGINX_MODULES_PATH}/*;
 
 # 配置环境变量和工作目录
 WORKDIR /etc/nginx
