@@ -50,7 +50,7 @@ jobs:
       ngx_zstd_lee_commit_id: "09ce44eb68bccaa855206f7316fa0219a54bea3f"
       ngx_geoip2_commit_id: "445df24ef3781e488cee3dfe8a1e111997fc1dfe"
       ngx_headers_more_commit_id: "v0.40"
-      njs_commit_id: "0.9.9"
+      njs_commit_id: "1.0.0"
       quickjs_commit_id: "04be246001599f5995fa2f2d8c91a0f198d3f34c"
       quickjs_ng_commit_id: "v0.11.0"
       ACTOR_LC: ${{ steps.set_case_params.outputs.ACTOR_LC }}

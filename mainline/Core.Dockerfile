@@ -26,9 +26,6 @@ RUN set -eux; \
 	# EXCLUDE_FILE=/opt/tools/exclude-libs.txt /opt/tools/extract-libs.sh /usr/lib/nginx/modules/ngx_http_headers_more_filter_module.so /deps; \
 	# EXCLUDE_FILE=/opt/tools/exclude-libs.txt /opt/tools/extract-libs.sh /usr/lib/nginx/modules/ngx_http_geoip2_module.so /deps; \
 	# EXCLUDE_FILE=/opt/tools/exclude-libs.txt /opt/tools/extract-libs.sh /usr/lib/nginx/modules/ngx_stream_geoip2_module.so /deps; \
-	### 【ngx_http_perl_module需要额外依赖库】
-	# EXCLUDE_FILE=/opt/tools/exclude-libs.txt /opt/tools/extract-libs.sh /usr/lib/nginx/modules/ngx_http_perl_module.so /deps; \
-	# EXTRA_DIRS="/usr/lib/perl5/vendor_perl" /extract-perl-modules.sh /deps; \
 	### 【only SSL Shared】
 	# EXCLUDE_FILE=/opt/tools/exclude-libs.txt /opt/tools/extract-libs.sh /usr/lib/nginx/modules/ngx_mail_module.so /deps; \
 	# EXCLUDE_FILE=/opt/tools/exclude-libs.txt /opt/tools/extract-libs.sh /usr/lib/nginx/modules/ngx_http_js_module.so /deps; \

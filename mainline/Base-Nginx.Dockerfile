@@ -1,4 +1,4 @@
-ARG BASE_IMAGE="gcc:15-trixie"
+ARG BASE_IMAGE="debian:trixie-slim"
 
 FROM ${BASE_IMAGE} AS builder
 
@@ -18,7 +18,7 @@ ARG NGX_HEADERS_MORE_COMMIT_ID="HEAD~0"
 
 ARG NJS_COMMIT_ID="HEAD~0"
 ARG QUICKJS_COMMIT_ID="HEAD~0"
-ARG QUICKJS_NG_COMMIT_ID="HEAD~0"
+ARG QUICKJS_NG_COMMIT_ID="v0.11.0"
 
 # nginx:alpine nginx -V
 
@@ -35,6 +35,9 @@ ARG NGINX_LD_OPT="-fuse-ld=lld -Wl,-O3 -Wl,--lto-O3 -Wl,--gc-sections -Wl,--icf=
 ARG NGINX_CC_OPT_EXT_NO_ERROR=""
 ARG NGINX_LD_OPT_EXT_NO_ERROR=""
 
+ARG QUICKJS_CC_OPT="-O3 -flto=thin -fPIC -fno-semantic-interposition -fomit-frame-pointer"
+ARG QUICKJS_LD_OPT="-fuse-ld=lld -Wl,-O3 -Wl,--lto-O3 -Wl,--gc-sections -Wl,--icf=safe"
+
 # https://nginx.org/en/pgp_keys.html
 # https://github.com/nginx/ci-self-hosted/blob/main/.github/workflows/nginx-buildbot.yml
 
@@ -49,7 +52,6 @@ ARG NGINX_BASE_CONFIG="\
 		--lock-path=/var/run/nginx.lock \
 		--http-client-body-temp-path=/var/cache/nginx/client_temp \
 		--http-proxy-temp-path=/var/cache/nginx/proxy_temp \
-		--with-perl_modules_path=/usr/lib/perl5/vendor_perl \
 		--user=nginx \
 		--group=nginx \
 	"
@@ -86,7 +88,6 @@ ARG NGINX_WITHOUT_MODULES="\
 ARG NGINX_DYNAMIC_MODULES="\
 #		--with-mail=dynamic \
 #		--with-mail_ssl_module \
-		--with-http_perl_module=dynamic \
 	"
 
 ARG NGINX_DYNAMIC_MODULES_EXTERNAL="\
@@ -130,7 +131,6 @@ RUN set -eux; \
 		libzstd-dev \
 		zlib1g-dev \
 		libpcre2-dev \
-		libperl-dev \
 		libmaxminddb-dev \
 		libxslt-dev \
 		libxml2-dev \
@@ -226,31 +226,31 @@ RUN set -eux; \
 ### ngx_http_js_module.so;
 ### ngx_stream_js_module.so;
 
-### ARG QJS_CC_OPT="-I/usr/src/quickjs"
-### ARG QJS_LD_OPT="-L/usr/src/quickjs"
+### ARG NGX_EXT_QJS_CC_OPT="-I/usr/src/quickjs"
+### ARG NGX_EXT_QJS_LD_OPT="-L/usr/src/quickjs"
 # RUN set -eux; \
 # 	git clone --recurse-submodules https://github.com/bellard/quickjs /usr/src/quickjs; \
 # 	cd /usr/src/quickjs; \
 # 	git checkout --force --quiet ${QUICKJS_COMMIT_ID}; \
 # 	git submodule update --init --recursive; \
 # 	mkdir -p build; \
-# 	CFLAGS="${NGINX_CC_OPT} -fPIC" LDFLAGS="${NGINX_LD_OPT}" make -j$(nproc) libquickjs.a;
+# 	CFLAGS="${QUICKJS_CC_OPT}" LDFLAGS="${QUICKJS_LD_OPT}" make -j$(nproc) libquickjs.a;
 
 ###### cmake
-### ARG QJS_CC_OPT="-I/usr/src/quickjs"
-### ARG QJS_LD_OPT="-L/usr/src/quickjs/build"
+### ARG NGX_EXT_QJS_CC_OPT="-I/usr/src/quickjs"
+### ARG NGX_EXT_QJS_LD_OPT="-L/usr/src/quickjs/build"
 ###### meson
-ARG QJS_CC_OPT=""
-ARG QJS_LD_OPT=""
+ARG NGX_EXT_QJS_CC_OPT=""
+ARG NGX_EXT_QJS_LD_OPT=""
 ######
 RUN set -eux; \
 	git clone --recurse-submodules https://github.com/quickjs-ng/quickjs /usr/src/quickjs; \
 	cd /usr/src/quickjs; \
 	git checkout --force --quiet ${QUICKJS_NG_COMMIT_ID}; \
 	git submodule update --init --recursive; \
-#	CFLAGS="${NGINX_CC_OPT} -fPIC" LDFLAGS="${NGINX_LD_OPT}" cmake -B build; \
+#	CFLAGS="${QUICKJS_CC_OPT}" LDFLAGS="${QUICKJS_LD_OPT}" cmake -B build; \
 #	cmake --build build --target qjs -j $(nproc);
-	CFLAGS="${NGINX_CC_OPT} -fPIC" LDFLAGS="${NGINX_LD_OPT}" meson setup build --prefix=${PKG_CONFIG_HOME} --libdir=${PKG_CONFIG_LIB_DIR}; \
+	CFLAGS="${QUICKJS_CC_OPT}" LDFLAGS="${QUICKJS_LD_OPT}" meson setup build --prefix=${PKG_CONFIG_HOME} --libdir=${PKG_CONFIG_LIB_DIR}; \
 	meson compile -C build; \
     meson install -C build;
 
@@ -275,8 +275,8 @@ RUN set -eux; \
 	./auto/configure ${NGINX_BASE_CONFIG} ${NGINX_CORE_MODULES} ${NGINX_WITHOUT_MODULES} ${NGINX_DYNAMIC_MODULES} ${NGINX_DYNAMIC_MODULES_EXTERNAL} \
 	--build="Nginx With Dynamic Modules[SSL Shared]" \
 	--with-cc=clang \
-	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include ${QJS_CC_OPT}" \
-	--with-ld-opt="${NGINX_LD_OPT} ${NGINX_LD_OPT_EXT_NO_ERROR} -L/usr/boringssl/lib ${QJS_LD_OPT} -lstdc++"; \
+	--with-cc-opt="${NGINX_CC_OPT} ${NGINX_CC_OPT_EXT_NO_ERROR} -I/usr/boringssl/include ${NGX_EXT_QJS_CC_OPT}" \
+	--with-ld-opt="${NGINX_LD_OPT} ${NGINX_LD_OPT_EXT_NO_ERROR} -L/usr/boringssl/lib ${NGX_EXT_QJS_LD_OPT} -lstdc++"; \
 	make -j"$(nproc)"; \
 	make install;
 
@@ -290,8 +290,8 @@ RUN set -eux; \
 
 # 精简运行文件
 RUN set -eux; \
-	strip /usr/sbin/nginx; \
-	strip ${NGINX_MODULES_PATH}/*;
+	strip --strip-unneeded /usr/sbin/nginx; \
+	strip --strip-unneeded ${NGINX_MODULES_PATH}/*;
 
 # 配置环境变量和工作目录
 WORKDIR /etc/nginx
