@@ -1,4 +1,4 @@
-name: BUILD_BORINGSSL_REUSABLE(V3.5)
+name: BUILD_BORINGSSL_CALLBACK(V3.5)
 
 # 可复用 workflow —— 每次调用在独立 ubuntu-latest runner 上执行
 # 由 build_ssl.yml 并行调用两次（static / shared），互不干扰
