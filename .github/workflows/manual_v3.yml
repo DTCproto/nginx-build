@@ -7,12 +7,12 @@ on:
       nginx_commit_id:
         description: "指定nginx使用commit id版本"
         required: true
-        default: "release-1.31.2"
+        default: "release-1.31.3"
         type: string
       ssl_commit_id:
         description: "指定BoringSSL使用commit id版本"
         required: true
-        default: "0.20260616.0"
+        default: "0.20260713.0"
         type: string
       nginx_patch_libs:
         description: "use nginx patch libs"

@@ -7,12 +7,12 @@ on:
       nginx_commit_id:
         description: "指定nginx(angie)使用commit id版本"
         required: true
-        default: "Angie-1.11.8"
+        default: "Angie-1.12.1"
         type: string
       ssl_commit_id:
         description: "指定BoringSSL使用commit id版本"
         required: true
-        default: "0.20260616.0"
+        default: "0.20260713.0"
         type: string
       nginx_patch_libs:
         description: "use nginx patch libs"
