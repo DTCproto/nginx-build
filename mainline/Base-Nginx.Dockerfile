@@ -250,7 +250,7 @@ RUN set -eux; \
 	git submodule update --init --recursive; \
 #	CFLAGS="${QUICKJS_CC_OPT}" LDFLAGS="${QUICKJS_LD_OPT}" cmake -B build; \
 #	cmake --build build --target qjs -j $(nproc);
-	CFLAGS="${QUICKJS_CC_OPT}" LDFLAGS="${QUICKJS_LD_OPT}" meson setup build --prefix=${PKG_CONFIG_HOME} --libdir=${PKG_CONFIG_LIB_DIR}; \
+	CFLAGS="${QUICKJS_CC_OPT}" LDFLAGS="${QUICKJS_LD_OPT}" meson setup build --prefix=${PKG_CONFIG_HOME} --libdir=${PKG_CONFIG_LIB_DIR} -Ddefault_library=static; \
 	meson compile -C build; \
     meson install -C build;
 
