@@ -138,12 +138,16 @@ RUN set -eux; \
 RUN set -eux; \
 	mkdir -p /opt/clang; \
 	cd /opt/clang; \
-    wget -qO llvm.sh https://apt.llvm.org/llvm.sh; \
-    chmod +x llvm.sh; \
-    ./llvm.sh 22 all; \
+	wget -qO llvm.sh \
+		--tries=5 \
+		--timeout=30 \
+		--waitretry=5 \
+		https://apt.llvm.org/llvm.sh; \
+	chmod +x llvm.sh; \
+	./llvm.sh 22 all; \
 	# 创建符号链接，以便 CMake 能找到 clang/clang++
-    ln -sf /usr/bin/clang-22 /usr/local/bin/clang; \
-    ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
+	ln -sf /usr/bin/clang-22 /usr/local/bin/clang; \
+	ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
 	ln -sf /usr/bin/lld-22 /usr/local/bin/lld;
 
 ENV CC=clang
