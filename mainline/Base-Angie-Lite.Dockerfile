@@ -150,8 +150,14 @@ RUN set -eux; \
 	ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
 	ln -sf /usr/bin/lld-22 /usr/local/bin/lld;
 
+# 将 Clang 22 的 bin 目录置于 PATH 最前面
+ENV PATH="/usr/lib/llvm-22/bin:${PATH}"
+
 ENV CC=clang
 ENV CXX=clang++
+ENV AR=llvm-ar
+ENV RANLIB=llvm-ranlib
+ENV NM=llvm-nm
 
 #################################################################################################
 

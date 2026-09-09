@@ -163,6 +163,9 @@ ENV PATH="/usr/lib/llvm-22/bin:${PATH}"
 
 ENV CC=clang
 ENV CXX=clang++
+ENV AR=llvm-ar
+ENV RANLIB=llvm-ranlib
+ENV NM=llvm-nm
 
 #################################################################################################
 
