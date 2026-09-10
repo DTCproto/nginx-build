@@ -1,0 +1,3751 @@
+From 640ce87e18059684a713b5b6fe1152194906a5c1 Mon Sep 17 00:00:00 2001
+From: local <local@local>
+Date: Thu, 10 Sep 2026 13:39:40 +0800
+Subject: [PATCH] quic h3 support bbr v2.4(ds)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+相对 v2.3 的优化：
+- 修复 sampler 内存分配失败被静默忽略导致的空指针崩溃，
+  ngx_quic_sampler_init() 改返回 ngx_int_t 并由 cc_init 检查
+- 移除无调用者的 ngx_quic_cc_on_packet_acked/lost 与
+  只写不读的 sample_max_inflight 字段
+- brutal 三个相同的事件回调合并为 ngx_quic_brutal_on_event
+- 增益循环数组提取为文件级 ngx_quic_bbr_gain_cycle
+- 统一使用 NGX_QUIC_SAMPLER_INVALID_PNUM 宏
+- 清理 cc_init/cc_reset_path 中 pacer 的重复初始化
+---
+ auto/modules                               |    8 +
+ src/event/quic/ngx_event_quic.c            |    8 +
+ src/event/quic/ngx_event_quic.h            |   18 +
+ src/event/quic/ngx_event_quic_ack.c        |  225 +++-
+ src/event/quic/ngx_event_quic_bbr.c        | 1118 ++++++++++++++++++++
+ src/event/quic/ngx_event_quic_bbr.h        |   18 +
+ src/event/quic/ngx_event_quic_brutal.c     |  351 ++++++
+ src/event/quic/ngx_event_quic_brutal.h     |   18 +
+ src/event/quic/ngx_event_quic_cc.c         |  477 +++++++++
+ src/event/quic/ngx_event_quic_cc.h         |   87 ++
+ src/event/quic/ngx_event_quic_connection.h |    5 +
+ src/event/quic/ngx_event_quic_migration.c  |   11 +-
+ src/event/quic/ngx_event_quic_output.c     |  112 +-
+ src/event/quic/ngx_event_quic_sampler.c    |  508 +++++++++
+ src/event/quic/ngx_event_quic_sampler.h    |  102 ++
+ src/event/quic/ngx_event_quic_transport.h  |   13 +
+ src/http/v3/ngx_http_v3_module.c           |  138 +++
+ 17 files changed, 3187 insertions(+), 30 deletions(-)
+ create mode 100644 src/event/quic/ngx_event_quic_bbr.c
+ create mode 100644 src/event/quic/ngx_event_quic_bbr.h
+ create mode 100644 src/event/quic/ngx_event_quic_brutal.c
+ create mode 100644 src/event/quic/ngx_event_quic_brutal.h
+ create mode 100644 src/event/quic/ngx_event_quic_cc.c
+ create mode 100644 src/event/quic/ngx_event_quic_cc.h
+ create mode 100644 src/event/quic/ngx_event_quic_sampler.c
+ create mode 100644 src/event/quic/ngx_event_quic_sampler.h
+
+diff --git a/auto/modules b/auto/modules
+index 3082c8f..297780c 100644
+--- a/auto/modules
++++ b/auto/modules
+@@ -1424,6 +1424,10 @@ if [ $USE_OPENSSL_QUIC = YES ]; then
+                      src/event/quic/ngx_event_quic_streams.h \
+                      src/event/quic/ngx_event_quic_ssl.h \
+                      src/event/quic/ngx_event_quic_tokens.h \
++                     src/event/quic/ngx_event_quic_sampler.h \
++                     src/event/quic/ngx_event_quic_cc.h \
++                     src/event/quic/ngx_event_quic_bbr.h \
++                     src/event/quic/ngx_event_quic_brutal.h \
+                      src/event/quic/ngx_event_quic_ack.h \
+                      src/event/quic/ngx_event_quic_output.h \
+                      src/event/quic/ngx_event_quic_socket.h \
+@@ -1438,6 +1442,10 @@ if [ $USE_OPENSSL_QUIC = YES ]; then
+                      src/event/quic/ngx_event_quic_streams.c \
+                      src/event/quic/ngx_event_quic_ssl.c \
+                      src/event/quic/ngx_event_quic_tokens.c \
++                     src/event/quic/ngx_event_quic_sampler.c \
++                     src/event/quic/ngx_event_quic_cc.c \
++                     src/event/quic/ngx_event_quic_bbr.c \
++                     src/event/quic/ngx_event_quic_brutal.c \
+                      src/event/quic/ngx_event_quic_ack.c \
+                      src/event/quic/ngx_event_quic_output.c \
+                      src/event/quic/ngx_event_quic_socket.c \
+diff --git a/src/event/quic/ngx_event_quic.c b/src/event/quic/ngx_event_quic.c
+index 09ce4b8..e1a7da3 100644
+--- a/src/event/quic/ngx_event_quic.c
++++ b/src/event/quic/ngx_event_quic.c
+@@ -344,6 +344,14 @@ ngx_quic_new_connection(ngx_connection_t *c, ngx_quic_conf_t *conf,
+         return NULL;
+     }
+ 
++    /* 拥塞控制初始化依赖 c->udp 和当前 path，必须在打开 socket 后执行。 */
++    if (ngx_quic_cc_init(c) != NGX_OK) {
++        ngx_quic_close_sockets(c);
++        c->udp = NULL;
++        ngx_quic_keys_cleanup(qc->keys);
++        return NULL;
++    }
++
+     c->idle = 1;
+     ngx_reusable_connection(c, 1);
+ 
+diff --git a/src/event/quic/ngx_event_quic.h b/src/event/quic/ngx_event_quic.h
+index 4f899ec..b97e3d0 100644
+--- a/src/event/quic/ngx_event_quic.h
++++ b/src/event/quic/ngx_event_quic.h
+@@ -48,6 +48,20 @@ typedef ngx_int_t (*ngx_quic_init_pt)(ngx_connection_t *c);
+ typedef void (*ngx_quic_shutdown_pt)(ngx_connection_t *c);
+ 
+ 
++typedef enum {
++    NGX_QUIC_CONGESTION_DEFAULT = 0,
++    NGX_QUIC_CONGESTION_BBR,
++    NGX_QUIC_CONGESTION_BRUTAL
++} ngx_quic_congestion_e;
++
++
++typedef enum {
++    NGX_QUIC_BBR_PROFILE_STANDARD = 0,
++    NGX_QUIC_BBR_PROFILE_CONSERVATIVE,
++    NGX_QUIC_BBR_PROFILE_AGGRESSIVE
++} ngx_quic_bbr_profile_e;
++
++
+ typedef enum {
+     NGX_QUIC_STREAM_SEND_READY = 0,
+     NGX_QUIC_STREAM_SEND_SEND,
+@@ -82,6 +96,10 @@ typedef struct {
+ 
+     ngx_flag_t                     retry;
+     ngx_flag_t                     gso_enabled;
++    ngx_uint_t                     congestion;
++    ngx_uint_t                     bbr_profile;
++    size_t                         brutal_up;
++    ngx_flag_t                     brutal_compensate_loss;
+     ngx_flag_t                     disable_active_migration;
+     ngx_msec_t                     handshake_timeout;
+     ngx_msec_t                     idle_timeout;
+diff --git a/src/event/quic/ngx_event_quic_ack.c b/src/event/quic/ngx_event_quic_ack.c
+index abd3f7a..7b45ca1 100644
+--- a/src/event/quic/ngx_event_quic_ack.c
++++ b/src/event/quic/ngx_event_quic_ack.c
+@@ -33,24 +33,43 @@ typedef struct {
+ } ngx_quic_ack_stat_t;
+ 
+ 
++typedef struct {
++    ngx_uint_t                               active;
++    ngx_uint_t                               blocked;
++    ngx_msec_t                               now;
++    size_t                                   prior_in_flight;
++    ngx_quic_sample_t                        sample;
++} ngx_quic_cc_event_t;
++
++
+ static ngx_inline ngx_msec_t ngx_quic_time_threshold(ngx_quic_connection_t *qc);
+ static uint64_t ngx_quic_packet_threshold(ngx_quic_send_ctx_t *ctx);
+ static void ngx_quic_rtt_sample(ngx_connection_t *c, ngx_quic_ack_frame_t *ack,
+     ngx_uint_t level, ngx_msec_t send_time);
++static void ngx_quic_cc_event_init(ngx_connection_t *c,
++    ngx_quic_cc_event_t *event);
++static void ngx_quic_cc_event_finalize(ngx_connection_t *c,
++    ngx_quic_cc_event_t *event);
+ static ngx_int_t ngx_quic_handle_ack_frame_range(ngx_connection_t *c,
+     ngx_quic_send_ctx_t *ctx, uint64_t min, uint64_t max,
+-    ngx_quic_ack_stat_t *st);
++    ngx_quic_ack_stat_t *st, ngx_quic_cc_event_t *cc_event);
+ static size_t ngx_quic_congestion_cubic(ngx_connection_t *c);
+ static void ngx_quic_drop_ack_ranges(ngx_connection_t *c,
+     ngx_quic_send_ctx_t *ctx, uint64_t pn);
+ static ngx_int_t ngx_quic_detect_lost(ngx_connection_t *c,
+-    ngx_quic_ack_stat_t *st);
++    ngx_quic_ack_stat_t *st, ngx_quic_cc_event_t *cc_event);
+ static ngx_msec_t ngx_quic_congestion_cubic_time(ngx_connection_t *c);
+ static ngx_msec_t ngx_quic_pcg_duration(ngx_connection_t *c);
+ static void ngx_quic_persistent_congestion(ngx_connection_t *c);
+ static ngx_msec_t ngx_quic_oldest_sent_packet(ngx_connection_t *c);
++static void ngx_quic_congestion_ack_event(ngx_connection_t *c,
++    ngx_quic_frame_t *frame, ngx_quic_cc_event_t *event);
+ static void ngx_quic_congestion_lost(ngx_connection_t *c,
+     ngx_quic_frame_t *frame);
++static void ngx_quic_congestion_lost_event(ngx_connection_t *c,
++    ngx_quic_frame_t *frame, ngx_quic_cc_event_t *event);
++static void ngx_quic_resend_frames_event(ngx_connection_t *c,
++    ngx_quic_send_ctx_t *ctx, ngx_quic_cc_event_t *event);
+ static void ngx_quic_lost_handler(ngx_event_t *ev);
+ 
+ 
+@@ -90,6 +109,59 @@ ngx_quic_packet_threshold(ngx_quic_send_ctx_t *ctx)
+ }
+ 
+ 
++static void
++ngx_quic_cc_event_init(ngx_connection_t *c, ngx_quic_cc_event_t *event)
++{
++    ngx_quic_congestion_t  *cg;
++    ngx_quic_connection_t  *qc;
++
++    if (ngx_quic_cc_is_default(c)) {
++        ngx_memzero(event, sizeof(ngx_quic_cc_event_t));
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++    cg = &qc->congestion;
++
++    ngx_memzero(event, sizeof(ngx_quic_cc_event_t));
++
++    event->active = 1;
++    event->now = ngx_current_msec;
++    event->blocked = !ngx_quic_cc_can_send(c, cg->in_flight);
++    event->prior_in_flight = cg->in_flight;
++
++    ngx_quic_sampler_sample_init(&event->sample);
++}
++
++
++static void
++ngx_quic_cc_event_finalize(ngx_connection_t *c, ngx_quic_cc_event_t *event)
++{
++    ngx_quic_congestion_t  *cg;
++    ngx_quic_connection_t  *qc;
++
++    if (!event->active) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++    cg = &qc->congestion;
++
++    ngx_quic_cc_on_congestion_event(c, &event->sample,
++                                    event->prior_in_flight, event->now);
++
++    ngx_log_debug5(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic congestion event cc t:%M win:%uz if:%uz"
++                   " acked:%uz lost:%uz",
++                   event->now, ngx_quic_cc_get_cwnd(c), cg->in_flight,
++                   event->sample.acked_bytes, event->sample.lost_bytes);
++
++    if (event->blocked && ngx_quic_cc_can_send(c, cg->in_flight)) {
++        ngx_post_event(&qc->push, &ngx_posted_events);
++    }
++}
++
++
+ ngx_int_t
+ ngx_quic_handle_ack_frame(ngx_connection_t *c, ngx_quic_header_t *pkt,
+     ngx_quic_frame_t *f)
+@@ -99,6 +171,7 @@ ngx_quic_handle_ack_frame(ngx_connection_t *c, ngx_quic_header_t *pkt,
+     uint64_t                min, max, gap, range;
+     ngx_uint_t              i;
+     ngx_quic_ack_stat_t     send_time;
++    ngx_quic_cc_event_t     cc_event;
+     ngx_quic_send_ctx_t    *ctx;
+     ngx_quic_ack_frame_t   *ack;
+     ngx_quic_connection_t  *qc;
+@@ -132,7 +205,10 @@ ngx_quic_handle_ack_frame(ngx_connection_t *c, ngx_quic_header_t *pkt,
+     send_time.oldest = NGX_TIMER_INFINITE;
+     send_time.newest = NGX_TIMER_INFINITE;
+ 
+-    if (ngx_quic_handle_ack_frame_range(c, ctx, min, max, &send_time)
++    ngx_quic_cc_event_init(c, &cc_event);
++
++    if (ngx_quic_handle_ack_frame_range(c, ctx, min, max, &send_time,
++                                        &cc_event)
+         != NGX_OK)
+     {
+         return NGX_ERROR;
+@@ -194,14 +270,21 @@ ngx_quic_handle_ack_frame(ngx_connection_t *c, ngx_quic_header_t *pkt,
+ 
+         min = max - range;
+ 
+-        if (ngx_quic_handle_ack_frame_range(c, ctx, min, max, &send_time)
++        if (ngx_quic_handle_ack_frame_range(c, ctx, min, max, &send_time,
++                                            &cc_event)
+             != NGX_OK)
+         {
+             return NGX_ERROR;
+         }
+     }
+ 
+-    return ngx_quic_detect_lost(c, &send_time);
++    if (ngx_quic_detect_lost(c, &send_time, &cc_event) != NGX_OK) {
++        return NGX_ERROR;
++    }
++
++    ngx_quic_cc_event_finalize(c, &cc_event);
++
++    return NGX_OK;
+ }
+ 
+ 
+@@ -251,7 +334,8 @@ ngx_quic_rtt_sample(ngx_connection_t *c, ngx_quic_ack_frame_t *ack,
+ 
+ static ngx_int_t
+ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
+-    uint64_t min, uint64_t max, ngx_quic_ack_stat_t *st)
++    uint64_t min, uint64_t max, ngx_quic_ack_stat_t *st,
++    ngx_quic_cc_event_t *cc_event)
+ {
+     ngx_uint_t              found;
+     ngx_queue_t            *q;
+@@ -281,7 +365,12 @@ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
+         }
+ 
+         if (f->pnum >= min) {
+-            ngx_quic_congestion_ack(c, f);
++            if (cc_event->active) {
++                ngx_quic_congestion_ack_event(c, f, cc_event);
++
++            } else {
++                ngx_quic_congestion_ack(c, f);
++            }
+ 
+             switch (f->type) {
+             case NGX_QUIC_FT_ACK:
+@@ -363,6 +452,15 @@ ngx_quic_congestion_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
+ 
+     now = ngx_current_msec;
+ 
++    if (!ngx_quic_cc_is_default(c)) {
++        ngx_quic_cc_event_t  cc_event;
++
++        ngx_quic_cc_event_init(c, &cc_event);
++        ngx_quic_congestion_ack_event(c, f, &cc_event);
++        ngx_quic_cc_event_finalize(c, &cc_event);
++        return;
++    }
++
+     blocked = (cg->in_flight >= cg->window) ? 1 : 0;
+ 
+     cg->in_flight -= f->plen;
+@@ -451,6 +549,31 @@ done:
+ }
+ 
+ 
++static void
++ngx_quic_congestion_ack_event(ngx_connection_t *c, ngx_quic_frame_t *f,
++    ngx_quic_cc_event_t *event)
++{
++    ngx_quic_congestion_t  *cg;
++    ngx_quic_connection_t  *qc;
++
++    if (f->plen == 0) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++    cg = &qc->congestion;
++
++    if (f->pnum < qc->rst_pnum) {
++        return;
++    }
++
++    ngx_quic_sampler_on_packet_acked(c, f, &event->sample);
++
++    cg->in_flight = (cg->in_flight > f->plen) ? cg->in_flight - f->plen
++                                              : 0;
++}
++
++
+ static size_t
+ ngx_quic_congestion_cubic(ngx_connection_t *c)
+ {
+@@ -591,13 +714,15 @@ ngx_quic_drop_ack_ranges(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
+ 
+ 
+ static ngx_int_t
+-ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
++ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st,
++    ngx_quic_cc_event_t *cc_event)
+ {
+     uint64_t                pkt_thr;
+     ngx_uint_t              i, nlost;
+     ngx_msec_t              now, wait, thr, oldest, newest;
+     ngx_queue_t            *q;
+     ngx_quic_frame_t       *start;
++    ngx_quic_cc_event_t     local_event;
+     ngx_quic_send_ctx_t    *ctx;
+     ngx_quic_connection_t  *qc;
+ 
+@@ -605,6 +730,11 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
+     now = ngx_current_msec;
+     thr = ngx_quic_time_threshold(qc);
+ 
++    if (cc_event == NULL) {
++        ngx_quic_cc_event_init(c, &local_event);
++        cc_event = &local_event;
++    }
++
+ #if (NGX_SUPPRESS_WARN)
+     oldest = now;
+     newest = now;
+@@ -660,7 +790,7 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
+                 nlost++;
+             }
+ 
+-            ngx_quic_resend_frames(c, ctx);
++            ngx_quic_resend_frames_event(c, ctx, cc_event);
+         }
+     }
+ 
+@@ -684,6 +814,10 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
+ 
+     ngx_quic_set_lost_timer(c);
+ 
++    if (cc_event == &local_event) {
++        ngx_quic_cc_event_finalize(c, cc_event);
++    }
++
+     return NGX_OK;
+ }
+ 
+@@ -714,6 +848,16 @@ ngx_quic_persistent_congestion(ngx_connection_t *c)
+     qc = ngx_quic_get_connection(c);
+     cg = &qc->congestion;
+ 
++    if (!ngx_quic_cc_is_default(c)) {
++        ngx_quic_cc_on_persistent_congestion(c);
++        cg->window = ngx_quic_cc_get_cwnd(c);
++
++        ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                       "quic congestion persistent cc t:%M win:%uz",
++                       ngx_current_msec, cg->window);
++        return;
++    }
++
+     cg->mtu = qc->path->mtu;
+     cg->recovery_start = ngx_quic_oldest_sent_packet(c) - 1;
+     cg->window = cg->mtu * 2;
+@@ -756,6 +900,18 @@ ngx_quic_oldest_sent_packet(ngx_connection_t *c)
+ 
+ void
+ ngx_quic_resend_frames(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
++{
++    ngx_quic_cc_event_t  cc_event;
++
++    ngx_quic_cc_event_init(c, &cc_event);
++    ngx_quic_resend_frames_event(c, ctx, &cc_event);
++    ngx_quic_cc_event_finalize(c, &cc_event);
++}
++
++
++static void
++ngx_quic_resend_frames_event(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
++    ngx_quic_cc_event_t *cc_event)
+ {
+     uint64_t                pnum;
+     ngx_queue_t            *q;
+@@ -771,7 +927,12 @@ ngx_quic_resend_frames(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
+     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                    "quic resend packet pnum:%uL", start->pnum);
+ 
+-    ngx_quic_congestion_lost(c, start);
++    if (cc_event->active) {
++        ngx_quic_congestion_lost_event(c, start, cc_event);
++
++    } else {
++        ngx_quic_congestion_lost(c, start);
++    }
+ 
+     do {
+         f = ngx_queue_data(q, ngx_quic_frame_t, queue);
+@@ -873,6 +1034,17 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
+         return;
+     }
+ 
++    now = ngx_current_msec;
++
++    if (!ngx_quic_cc_is_default(c)) {
++        ngx_quic_cc_event_t  cc_event;
++
++        ngx_quic_cc_event_init(c, &cc_event);
++        ngx_quic_congestion_lost_event(c, f, &cc_event);
++        ngx_quic_cc_event_finalize(c, &cc_event);
++        return;
++    }
++
+     blocked = (cg->in_flight >= cg->window) ? 1 : 0;
+ 
+     cg->in_flight -= f->plen;
+@@ -880,8 +1052,6 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
+ 
+     timer = f->send_time - cg->recovery_start;
+ 
+-    now = ngx_current_msec;
+-
+     if ((ngx_msec_int_t) timer <= 0) {
+         ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                        "quic congestion lost rec t:%M win:%uz if:%uz",
+@@ -924,6 +1094,35 @@ done:
+ }
+ 
+ 
++static void
++ngx_quic_congestion_lost_event(ngx_connection_t *c, ngx_quic_frame_t *f,
++    ngx_quic_cc_event_t *event)
++{
++    ngx_quic_congestion_t  *cg;
++    ngx_quic_connection_t  *qc;
++
++    if (f->plen == 0) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++    cg = &qc->congestion;
++
++    if (f->pnum < qc->rst_pnum) {
++        return;
++    }
++
++    cg->in_flight = (cg->in_flight > f->plen) ? cg->in_flight - f->plen
++                                              : 0;
++
++    if (!f->ignore_loss) {
++        ngx_quic_sampler_on_packet_lost(c, f, &event->sample);
++    }
++
++    f->plen = 0;
++}
++
++
+ static ngx_msec_t
+ ngx_quic_congestion_cubic_time(ngx_connection_t *c)
+ {
+@@ -1090,7 +1289,7 @@ void ngx_quic_lost_handler(ngx_event_t *ev)
+ 
+     c = ev->data;
+ 
+-    if (ngx_quic_detect_lost(c, NULL) != NGX_OK) {
++    if (ngx_quic_detect_lost(c, NULL, NULL) != NGX_OK) {
+         ngx_quic_close_connection(c, NGX_ERROR);
+         return;
+     }
+diff --git a/src/event/quic/ngx_event_quic_bbr.c b/src/event/quic/ngx_event_quic_bbr.c
+new file mode 100644
+index 0000000..8fd7120
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_bbr.c
+@@ -0,0 +1,1118 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_event_quic_connection.h>
++
++
++#define NGX_QUIC_BBR_SCALE              1000
++#define NGX_QUIC_BBR_BW_WINDOW           10
++#define NGX_QUIC_BBR_MIN_BW           65536
++#define NGX_QUIC_BBR_MIN_RTT_EXPIRY   10000
++#define NGX_QUIC_BBR_PROBE_RTT_TIME     200
++#define NGX_QUIC_BBR_STARTUP_LOSS_EVENTS  8
++#define NGX_QUIC_BBR_LOSS_THRESHOLD      20
++
++/* PROBE_BW 增益循环：1.25 倍探测、0.75 倍排空、其余 1.0 倍保持 */
++static ngx_uint_t  ngx_quic_bbr_gain_cycle[8] = {
++    1250, 750, 1000, 1000, 1000, 1000, 1000, 1000
++};
++
++
++typedef enum {
++    NGX_QUIC_BBR_STARTUP = 0,
++    NGX_QUIC_BBR_DRAIN,
++    NGX_QUIC_BBR_PROBE_BW,
++    NGX_QUIC_BBR_PROBE_RTT
++} ngx_quic_bbr_mode_e;
++
++
++typedef enum {
++    NGX_QUIC_BBR_RECOVERY_NONE = 0,
++    NGX_QUIC_BBR_RECOVERY_CONSERVATION,
++    NGX_QUIC_BBR_RECOVERY_GROWTH
++} ngx_quic_bbr_recovery_e;
++
++
++/* Kathleen Nichols windowed max filter: maintains best/2nd/3rd estimates
++ * over a fixed window of rounds, with automatic expiry */
++typedef struct {
++    uint64_t  sample;
++    uint64_t  time;
++} ngx_quic_bbr_filter_est_t;
++
++
++typedef struct {
++    uint64_t                 window_length;
++    ngx_quic_bbr_filter_est_t est[3];
++} ngx_quic_bbr_max_filter_t;
++
++
++typedef struct {
++    ngx_uint_t                       mode;
++    ngx_uint_t                       profile;
++    ngx_uint_t                       recovery_state;
++
++    ngx_quic_bbr_max_filter_t        max_bw_filter;
++    uint64_t                         max_bw;
++    uint64_t                         full_bw;
++    uint64_t                         pacing_rate;
++
++    size_t                           cwnd;
++    size_t                           recovery_window;
++    size_t                           initial_cwnd;
++    size_t                           min_cwnd;
++    size_t                           max_cwnd;
++    size_t                           max_datagram;
++    size_t                           cwnd_to_calculate_min_pacing_rate;
++
++    ngx_msec_t                       min_rtt;
++    ngx_msec_t                       min_rtt_stamp;
++    ngx_msec_t                       cycle_stamp;
++    ngx_msec_t                       probe_rtt_done_stamp;
++
++    uint64_t                         round_count;
++    uint64_t                         last_sent_packet;
++    uint64_t                         current_round_end;
++    uint64_t                         end_recovery_at;
++    uint64_t                         bytes_lost_in_round;
++    uint64_t                         bytes_lost_while_detecting_overshooting;
++
++    ngx_uint_t                       num_loss_events_in_round;
++    ngx_uint_t                       rounds_without_bw_gain;
++    ngx_uint_t                       cycle_index;
++
++    ngx_uint_t                       high_gain;
++    ngx_uint_t                       high_cwnd_gain;
++    ngx_uint_t                       cwnd_gain;
++    ngx_uint_t                       drain_gain;
++    ngx_uint_t                       pacing_gain;
++    ngx_uint_t                       congestion_window_gain;
++    ngx_uint_t                       num_startup_rtts;
++    ngx_uint_t                       bytes_lost_multiplier;
++
++    ngx_uint_t                       is_at_full_bandwidth;
++    ngx_uint_t                       last_sample_is_app_limited;
++    ngx_uint_t                       has_non_app_limited_sample;
++    ngx_uint_t                       exiting_quiescence;
++    ngx_uint_t                       probe_rtt_round_passed;
++
++    ngx_uint_t                       drain_to_target;
++    ngx_uint_t                       detect_overshooting;
++    ngx_uint_t                       enable_ack_aggregation_startup;
++    ngx_uint_t                       expire_ack_aggregation_startup;
++} ngx_quic_bbr_t;
++
++
++static ngx_int_t ngx_quic_bbr_init(ngx_connection_t *c);
++static void ngx_quic_bbr_reset_path(ngx_connection_t *c);
++static ngx_uint_t ngx_quic_bbr_can_send(ngx_connection_t *c,
++    size_t bytes_in_flight);
++static ngx_uint_t ngx_quic_bbr_has_pacing_budget(ngx_connection_t *c,
++    ngx_msec_t now);
++static size_t ngx_quic_bbr_pacing_budget(ngx_connection_t *c,
++    ngx_msec_t now);
++static ngx_msec_t ngx_quic_bbr_time_until_send(ngx_connection_t *c,
++    ngx_msec_t now);
++static void ngx_quic_bbr_on_packet_sent(ngx_connection_t *c,
++    ngx_quic_frame_t *f);
++static void ngx_quic_bbr_on_ack_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now);
++static void ngx_quic_bbr_on_loss_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now);
++static void ngx_quic_bbr_on_congestion_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now);
++static size_t ngx_quic_bbr_get_cwnd(ngx_connection_t *c);
++static void ngx_quic_bbr_set_max_datagram_size(ngx_connection_t *c,
++    size_t max_datagram);
++static void ngx_quic_bbr_on_persistent_congestion(ngx_connection_t *c);
++
++static void ngx_quic_bbr_init_state(ngx_connection_t *c, ngx_quic_bbr_t *bbr);
++static void ngx_quic_bbr_set_profile(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr);
++static uint64_t ngx_quic_bbr_max_bw(ngx_quic_bbr_t *bbr);
++static ngx_uint_t ngx_quic_bbr_update_bw(ngx_quic_bbr_t *bbr,
++    ngx_quic_sample_t *sample);
++static size_t ngx_quic_bbr_target_cwnd(ngx_quic_bbr_t *bbr, ngx_uint_t gain);
++static void ngx_quic_bbr_enter_startup(ngx_quic_bbr_t *bbr);
++static void ngx_quic_bbr_enter_probe_bw(ngx_quic_bbr_t *bbr, ngx_msec_t now);
++static void ngx_quic_bbr_maybe_app_limited(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr, size_t prior_in_flight);
++static void ngx_quic_bbr_check_full_bw(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr, ngx_quic_sample_t *sample);
++static ngx_uint_t ngx_quic_bbr_should_exit_startup_due_to_loss(
++    ngx_quic_bbr_t *bbr, ngx_quic_sample_t *sample);
++static void ngx_quic_bbr_maybe_exit_startup_or_drain(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr, ngx_msec_t now);
++static void ngx_quic_bbr_maybe_probe_rtt(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr, ngx_quic_sample_t *sample, ngx_msec_t now,
++    ngx_uint_t min_rtt_expired);
++static void ngx_quic_bbr_update_gain_cycle(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr, ngx_msec_t now, size_t prior_in_flight,
++    ngx_uint_t has_losses);
++static void ngx_quic_bbr_update_recovery_state(ngx_quic_bbr_t *bbr,
++    ngx_quic_sample_t *sample, ngx_uint_t has_losses);
++static void ngx_quic_bbr_calculate_pacing_rate(ngx_quic_bbr_t *bbr,
++    size_t bytes_lost);
++static void ngx_quic_bbr_calculate_cwnd(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr, ngx_quic_sample_t *sample);
++static void ngx_quic_bbr_calculate_recovery_window(ngx_quic_bbr_t *bbr,
++    size_t bytes_acked, size_t bytes_lost, size_t bytes_in_flight);
++static void ngx_quic_bbr_update_control(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now, ngx_uint_t has_losses);
++static uint64_t ngx_quic_bbr_scale_bw(uint64_t bw, ngx_uint_t gain);
++static uint64_t ngx_quic_bbr_rate(ngx_quic_bbr_t *bbr);
++static size_t ngx_quic_bbr_rescale_window(size_t window, size_t old_size,
++    size_t new_size);
++static size_t ngx_quic_bbr_clamp_cwnd(ngx_quic_bbr_t *bbr, size_t cwnd);
++static size_t ngx_quic_bbr_add_window(size_t a, size_t b);
++
++static void ngx_quic_bbr_filter_reset(ngx_quic_bbr_max_filter_t *f,
++    uint64_t sample, uint64_t time);
++static void ngx_quic_bbr_filter_update(ngx_quic_bbr_max_filter_t *f,
++    uint64_t sample, uint64_t time);
++static uint64_t ngx_quic_bbr_filter_best(ngx_quic_bbr_max_filter_t *f);
++
++
++const ngx_quic_cc_ops_t  ngx_quic_bbr_ops = {
++    ngx_quic_bbr_init,
++    ngx_quic_bbr_reset_path,
++    ngx_quic_bbr_can_send,
++    ngx_quic_bbr_has_pacing_budget,
++    ngx_quic_bbr_pacing_budget,
++    ngx_quic_bbr_time_until_send,
++    ngx_quic_bbr_on_packet_sent,
++    ngx_quic_bbr_on_ack_event,
++    ngx_quic_bbr_on_loss_event,
++    ngx_quic_bbr_on_congestion_event,
++    ngx_quic_bbr_get_cwnd,
++    ngx_quic_bbr_set_max_datagram_size,
++    ngx_quic_bbr_on_persistent_congestion
++};
++
++
++static ngx_int_t
++ngx_quic_bbr_init(ngx_connection_t *c)
++{
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    bbr = ngx_pcalloc(c->pool, sizeof(ngx_quic_bbr_t));
++    if (bbr == NULL) {
++        return NGX_ERROR;
++    }
++
++    qc->cc.ctx = bbr;
++    ngx_quic_bbr_init_state(c, bbr);
++
++    return NGX_OK;
++}
++
++
++static void
++ngx_quic_bbr_reset_path(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    ngx_quic_bbr_init_state(c, qc->cc.ctx);
++}
++
++
++static ngx_uint_t
++ngx_quic_bbr_can_send(ngx_connection_t *c, size_t bytes_in_flight)
++{
++    return bytes_in_flight < ngx_quic_bbr_get_cwnd(c);
++}
++
++
++static ngx_uint_t
++ngx_quic_bbr_has_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    return ngx_quic_pacer_budget(&qc->cc.pacer, ngx_quic_bbr_rate(bbr), now)
++           >= qc->path->mtu;
++}
++
++
++static size_t
++ngx_quic_bbr_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    return ngx_quic_pacer_budget(&qc->cc.pacer, ngx_quic_bbr_rate(bbr), now);
++}
++
++
++static ngx_msec_t
++ngx_quic_bbr_time_until_send(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    return ngx_quic_pacer_time_until_send(&qc->cc.pacer,
++                                          ngx_quic_bbr_rate(bbr), now);
++}
++
++
++static void
++ngx_quic_bbr_on_packet_sent(ngx_connection_t *c, ngx_quic_frame_t *f)
++{
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    if (qc->congestion.in_flight == 0) {
++        bbr->exiting_quiescence = 1;
++    }
++
++    bbr->last_sent_packet = f->pnum;
++
++    ngx_quic_pacer_sent(&qc->cc.pacer, ngx_quic_bbr_rate(bbr),
++                        f->send_time, f->plen);
++}
++
++
++static void
++ngx_quic_bbr_on_ack_event(ngx_connection_t *c, ngx_quic_sample_t *sample,
++    ngx_msec_t now)
++{
++    ngx_quic_bbr_update_control(c, sample, now, 0);
++}
++
++
++static void
++ngx_quic_bbr_on_loss_event(ngx_connection_t *c, ngx_quic_sample_t *sample,
++    ngx_msec_t now)
++{
++    ngx_quic_bbr_update_control(c, sample, now, 1);
++}
++
++
++static void
++ngx_quic_bbr_on_congestion_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now)
++{
++    ngx_quic_bbr_update_control(c, sample, now, sample->lost_bytes != 0);
++}
++
++
++static size_t
++ngx_quic_bbr_get_cwnd(ngx_connection_t *c)
++{
++    size_t                  cwnd;
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    if (bbr->mode == NGX_QUIC_BBR_PROBE_RTT) {
++        return bbr->min_cwnd;
++    }
++
++    cwnd = bbr->cwnd;
++
++    if (bbr->recovery_state != NGX_QUIC_BBR_RECOVERY_NONE) {
++        cwnd = ngx_min(cwnd, bbr->recovery_window);
++    }
++
++    return ngx_quic_bbr_clamp_cwnd(bbr, cwnd);
++}
++
++
++static void
++ngx_quic_bbr_set_max_datagram_size(ngx_connection_t *c, size_t max_datagram)
++{
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    if (max_datagram == 0 || max_datagram == bbr->max_datagram) {
++        return;
++    }
++
++    bbr->initial_cwnd = ngx_quic_bbr_rescale_window(bbr->initial_cwnd,
++                                                    bbr->max_datagram,
++                                                    max_datagram);
++    bbr->min_cwnd = 4 * max_datagram;
++    bbr->cwnd_to_calculate_min_pacing_rate =
++        ngx_quic_bbr_rescale_window(bbr->cwnd_to_calculate_min_pacing_rate,
++                                    bbr->max_datagram, max_datagram);
++
++    if (bbr->max_cwnd != NGX_MAX_SIZE_T_VALUE) {
++        bbr->max_cwnd = ngx_quic_bbr_rescale_window(bbr->max_cwnd,
++                                                    bbr->max_datagram,
++                                                    max_datagram);
++    }
++
++    bbr->cwnd = ngx_quic_bbr_clamp_cwnd(bbr, bbr->cwnd);
++    bbr->recovery_window = ngx_quic_bbr_clamp_cwnd(bbr,
++                                                   bbr->recovery_window);
++    bbr->max_datagram = max_datagram;
++    qc->congestion.window = ngx_quic_bbr_get_cwnd(c);
++}
++
++
++static void
++ngx_quic_bbr_on_persistent_congestion(ngx_connection_t *c)
++{
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    bbr->is_at_full_bandwidth = 1;
++    bbr->recovery_state = NGX_QUIC_BBR_RECOVERY_CONSERVATION;
++    bbr->recovery_window = bbr->min_cwnd;
++    bbr->cwnd = bbr->min_cwnd;
++
++    qc->congestion.window = ngx_quic_bbr_get_cwnd(c);
++}
++
++
++static void
++ngx_quic_bbr_init_state(ngx_connection_t *c, ngx_quic_bbr_t *bbr)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    ngx_memzero(bbr, sizeof(ngx_quic_bbr_t));
++
++    bbr->max_bw_filter.window_length = NGX_QUIC_BBR_BW_WINDOW;
++
++    ngx_quic_cc_reset_default(c);
++    ngx_quic_bbr_set_profile(c, bbr);
++
++    bbr->min_rtt = NGX_TIMER_INFINITE;
++    bbr->min_rtt_stamp = ngx_current_msec;
++    bbr->last_sent_packet = NGX_QUIC_SAMPLER_INVALID_PNUM;
++    bbr->current_round_end = NGX_QUIC_SAMPLER_INVALID_PNUM;
++    bbr->end_recovery_at = NGX_QUIC_SAMPLER_INVALID_PNUM;
++
++    bbr->max_datagram = ngx_max(qc->path->mtu, NGX_QUIC_MIN_INITIAL_SIZE);
++    bbr->initial_cwnd = 32 * bbr->max_datagram;
++    bbr->min_cwnd = 4 * bbr->max_datagram;
++    bbr->max_cwnd = NGX_MAX_SIZE_T_VALUE;
++    bbr->cwnd = bbr->initial_cwnd;
++    bbr->recovery_window = bbr->max_cwnd;
++    bbr->cwnd_to_calculate_min_pacing_rate = bbr->initial_cwnd;
++    /* initial pacing from initial_cwnd / 100ms * high_gain, matching quic-go BBR */
++    bbr->pacing_rate = (uint64_t) bbr->initial_cwnd * 10
++                       * bbr->high_gain / NGX_QUIC_BBR_SCALE;
++
++    ngx_quic_bbr_enter_startup(bbr);
++
++    qc->congestion.window = bbr->cwnd;
++    qc->congestion.ssthresh = (size_t) -1;
++
++    ngx_quic_pacer_init(&qc->cc.pacer, bbr->max_datagram);
++
++    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic bbr init profile:%ui cwnd:%uz rate:%uL gain:%ui",
++                   bbr->profile, bbr->cwnd, bbr->pacing_rate,
++                   bbr->high_gain);
++}
++
++
++static void
++ngx_quic_bbr_set_profile(ngx_connection_t *c, ngx_quic_bbr_t *bbr)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr->profile = qc->conf->bbr_profile;
++
++    switch (qc->conf->bbr_profile) {
++    case NGX_QUIC_BBR_PROFILE_CONSERVATIVE:
++        bbr->high_gain = 2250;
++        bbr->high_cwnd_gain = 1750;
++        bbr->cwnd_gain = 1750;
++        bbr->num_startup_rtts = 2;
++        bbr->bytes_lost_multiplier = 1;
++        bbr->detect_overshooting = 1;
++        bbr->drain_to_target = 1;
++        ngx_quic_sampler_enable_overestimate_avoidance(c);
++        ngx_quic_sampler_set_reduce_extra_acked(c, 1);
++        break;
++
++    case NGX_QUIC_BBR_PROFILE_AGGRESSIVE:
++        bbr->high_gain = 3000;
++        bbr->high_cwnd_gain = 2250;
++        bbr->cwnd_gain = 2500;
++        bbr->num_startup_rtts = 4;
++        bbr->bytes_lost_multiplier = 2;
++        bbr->enable_ack_aggregation_startup = 1;
++        bbr->expire_ack_aggregation_startup = 1;
++        break;
++
++    default:
++        bbr->high_gain = 2885;
++        bbr->high_cwnd_gain = 2000;
++        bbr->cwnd_gain = 2000;
++        bbr->num_startup_rtts = 3;
++        bbr->bytes_lost_multiplier = 2;
++        break;
++    }
++
++    bbr->drain_gain = NGX_QUIC_BBR_SCALE * NGX_QUIC_BBR_SCALE
++                      / bbr->high_gain;
++}
++
++
++static void
++ngx_quic_bbr_filter_reset(ngx_quic_bbr_max_filter_t *f, uint64_t sample,
++    uint64_t time)
++{
++    f->est[2].sample = sample;
++    f->est[2].time = time;
++    f->est[1] = f->est[2];
++    f->est[0] = f->est[1];
++}
++
++
++static void
++ngx_quic_bbr_filter_update(ngx_quic_bbr_max_filter_t *f, uint64_t sample,
++    uint64_t time)
++{
++    /* uninitialized, new best, or oldest estimate expired → reset all */
++    if (f->est[0].sample == 0
++        || sample >= f->est[0].sample
++        || time - f->est[2].time > f->window_length)
++    {
++        ngx_quic_bbr_filter_reset(f, sample, time);
++        return;
++    }
++
++    if (sample >= f->est[1].sample) {
++        f->est[1].sample = sample;
++        f->est[1].time = time;
++        f->est[2] = f->est[1];
++
++    } else if (sample >= f->est[2].sample) {
++        f->est[2].sample = sample;
++        f->est[2].time = time;
++    }
++
++    /* expire best estimate after a full window */
++    if (time - f->est[0].time > f->window_length) {
++        f->est[0] = f->est[1];
++        f->est[1] = f->est[2];
++        f->est[2].sample = sample;
++        f->est[2].time = time;
++
++        if (time - f->est[0].time > f->window_length) {
++            f->est[0] = f->est[1];
++            f->est[1] = f->est[2];
++        }
++        return;
++    }
++
++    /* second-best: take from 2nd quarter of window if no better sample */
++    if (f->est[1].sample == f->est[0].sample
++        && time - f->est[1].time > f->window_length / 4)
++    {
++        f->est[1].sample = sample;
++        f->est[1].time = time;
++        f->est[2] = f->est[1];
++        return;
++    }
++
++    /* third-best: take from 2nd half of window if no better sample */
++    if (f->est[2].sample == f->est[1].sample
++        && time - f->est[2].time > f->window_length / 2)
++    {
++        f->est[2].sample = sample;
++        f->est[2].time = time;
++    }
++}
++
++
++static uint64_t
++ngx_quic_bbr_filter_best(ngx_quic_bbr_max_filter_t *f)
++{
++    return f->est[0].sample;
++}
++
++
++static uint64_t
++ngx_quic_bbr_max_bw(ngx_quic_bbr_t *bbr)
++{
++    return ngx_quic_bbr_filter_best(&bbr->max_bw_filter);
++}
++
++
++static ngx_uint_t
++ngx_quic_bbr_update_bw(ngx_quic_bbr_t *bbr, ngx_quic_sample_t *sample)
++{
++    uint64_t  old;
++
++    if (sample->delivery_rate == 0) {
++        return 0;
++    }
++
++    old = bbr->max_bw;
++
++    if (!sample->sample_is_app_limited || sample->delivery_rate >= old) {
++        ngx_quic_bbr_filter_update(&bbr->max_bw_filter,
++                                   sample->delivery_rate, bbr->round_count);
++        bbr->max_bw = ngx_quic_bbr_max_bw(bbr);
++    }
++
++    return bbr->max_bw > old;
++}
++
++
++static size_t
++ngx_quic_bbr_target_cwnd(ngx_quic_bbr_t *bbr, ngx_uint_t gain)
++{
++    uint64_t  target;
++
++    if (bbr->max_bw == 0 || bbr->min_rtt == NGX_TIMER_INFINITE) {
++        target = bbr->initial_cwnd;
++
++    } else {
++        if (bbr->max_bw > (uint64_t) NGX_MAX_SIZE_T_VALUE / bbr->min_rtt) {
++            return bbr->max_cwnd;
++        }
++
++        target = bbr->max_bw * bbr->min_rtt / 1000;
++    }
++
++    if (target > (uint64_t) NGX_MAX_SIZE_T_VALUE / gain) {
++        return bbr->max_cwnd;
++    }
++
++    target = target * gain / NGX_QUIC_BBR_SCALE;
++    target = ngx_max(target, bbr->min_cwnd);
++    target = ngx_min(target, bbr->max_cwnd);
++
++    return (size_t) target;
++}
++
++
++static void
++ngx_quic_bbr_enter_startup(ngx_quic_bbr_t *bbr)
++{
++    bbr->mode = NGX_QUIC_BBR_STARTUP;
++    bbr->pacing_gain = bbr->high_gain;
++    bbr->congestion_window_gain = bbr->high_cwnd_gain;
++}
++
++
++static void
++ngx_quic_bbr_enter_probe_bw(ngx_quic_bbr_t *bbr, ngx_msec_t now)
++{
++    bbr->mode = NGX_QUIC_BBR_PROBE_BW;
++    bbr->congestion_window_gain = bbr->cwnd_gain;
++
++    bbr->cycle_index = ngx_random() % 7;
++    if (bbr->cycle_index >= 1) {
++        bbr->cycle_index++;
++    }
++
++    bbr->cycle_stamp = now;
++    bbr->pacing_gain = ngx_quic_bbr_gain_cycle[bbr->cycle_index];
++}
++
++
++static void
++ngx_quic_bbr_maybe_app_limited(ngx_connection_t *c, ngx_quic_bbr_t *bbr,
++    size_t prior_in_flight)
++{
++    if (prior_in_flight < ngx_quic_bbr_target_cwnd(bbr, NGX_QUIC_BBR_SCALE)) {
++        ngx_quic_sampler_on_app_limited(c);
++    }
++}
++
++
++static void
++ngx_quic_bbr_check_full_bw(ngx_connection_t *c, ngx_quic_bbr_t *bbr,
++    ngx_quic_sample_t *sample)
++{
++    uint64_t  target;
++
++    if (bbr->last_sample_is_app_limited) {
++        return;
++    }
++
++    target = bbr->full_bw * 125 / 100;
++
++    if (bbr->max_bw >= target) {
++        bbr->full_bw = bbr->max_bw;
++        bbr->rounds_without_bw_gain = 0;
++
++        if (bbr->expire_ack_aggregation_startup) {
++            ngx_quic_sampler_reset_ack_height(c, bbr->round_count);
++        }
++
++        return;
++    }
++
++    bbr->rounds_without_bw_gain++;
++
++    if (bbr->rounds_without_bw_gain >= bbr->num_startup_rtts
++        || ngx_quic_bbr_should_exit_startup_due_to_loss(bbr, sample))
++    {
++        bbr->is_at_full_bandwidth = 1;
++    }
++}
++
++
++static ngx_uint_t
++ngx_quic_bbr_should_exit_startup_due_to_loss(ngx_quic_bbr_t *bbr,
++    ngx_quic_sample_t *sample)
++{
++    size_t  inflight;
++
++    if (bbr->num_loss_events_in_round < NGX_QUIC_BBR_STARTUP_LOSS_EVENTS
++        || !sample->last_packet_state.valid)
++    {
++        return 0;
++    }
++
++    inflight = sample->last_packet_state.bytes_in_flight;
++
++    return inflight != 0
++           && bbr->bytes_lost_in_round
++              > inflight * NGX_QUIC_BBR_LOSS_THRESHOLD / 1000;
++}
++
++
++static void
++ngx_quic_bbr_maybe_exit_startup_or_drain(ngx_connection_t *c,
++    ngx_quic_bbr_t *bbr, ngx_msec_t now)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    if (bbr->mode == NGX_QUIC_BBR_STARTUP && bbr->is_at_full_bandwidth) {
++        bbr->mode = NGX_QUIC_BBR_DRAIN;
++        bbr->pacing_gain = bbr->drain_gain;
++        bbr->congestion_window_gain = bbr->high_cwnd_gain;
++    }
++
++    if (bbr->mode == NGX_QUIC_BBR_DRAIN
++        && qc->congestion.in_flight
++           <= ngx_quic_bbr_target_cwnd(bbr, NGX_QUIC_BBR_SCALE))
++    {
++        ngx_quic_bbr_enter_probe_bw(bbr, now);
++    }
++}
++
++
++static void
++ngx_quic_bbr_maybe_probe_rtt(ngx_connection_t *c, ngx_quic_bbr_t *bbr,
++    ngx_quic_sample_t *sample, ngx_msec_t now, ngx_uint_t min_rtt_expired)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    if (min_rtt_expired && !bbr->exiting_quiescence
++        && bbr->mode != NGX_QUIC_BBR_PROBE_RTT)
++    {
++        bbr->mode = NGX_QUIC_BBR_PROBE_RTT;
++        bbr->pacing_gain = NGX_QUIC_BBR_SCALE;
++        bbr->probe_rtt_done_stamp = 0;
++        bbr->probe_rtt_round_passed = 0;
++    }
++
++    if (bbr->mode != NGX_QUIC_BBR_PROBE_RTT) {
++        bbr->exiting_quiescence = 0;
++        return;
++    }
++
++    ngx_quic_sampler_on_app_limited(c);
++
++    if (bbr->probe_rtt_done_stamp == 0) {
++        if (qc->congestion.in_flight < bbr->min_cwnd + bbr->max_datagram) {
++            bbr->probe_rtt_done_stamp = now + NGX_QUIC_BBR_PROBE_RTT_TIME;
++            bbr->probe_rtt_round_passed = 0;
++        }
++
++    } else {
++        if (sample->round_start) {
++            bbr->probe_rtt_round_passed = 1;
++        }
++
++        if ((ngx_msec_int_t) (now - bbr->probe_rtt_done_stamp) >= 0
++            && bbr->probe_rtt_round_passed)
++        {
++            bbr->min_rtt_stamp = now;
++
++            if (!bbr->is_at_full_bandwidth) {
++                ngx_quic_bbr_enter_startup(bbr);
++
++            } else {
++                ngx_quic_bbr_enter_probe_bw(bbr, now);
++            }
++        }
++    }
++
++    bbr->exiting_quiescence = 0;
++}
++
++
++static void
++ngx_quic_bbr_update_gain_cycle(ngx_connection_t *c, ngx_quic_bbr_t *bbr,
++    ngx_msec_t now, size_t prior_in_flight, ngx_uint_t has_losses)
++{
++    ngx_uint_t              advance;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    if (bbr->mode != NGX_QUIC_BBR_PROBE_BW
++        || bbr->min_rtt == NGX_TIMER_INFINITE)
++    {
++        return;
++    }
++
++    advance = now - bbr->cycle_stamp >= bbr->min_rtt;
++
++    if (bbr->pacing_gain > NGX_QUIC_BBR_SCALE && !has_losses
++        && prior_in_flight < ngx_quic_bbr_target_cwnd(bbr, bbr->pacing_gain))
++    {
++        advance = 0;
++    }
++
++    if (bbr->pacing_gain < NGX_QUIC_BBR_SCALE
++        && qc->congestion.in_flight
++           <= ngx_quic_bbr_target_cwnd(bbr, NGX_QUIC_BBR_SCALE))
++    {
++        advance = 1;
++    }
++
++    if (!advance) {
++        return;
++    }
++
++    bbr->cycle_index = (bbr->cycle_index + 1) % 8;
++    bbr->cycle_stamp = now;
++
++    if (bbr->drain_to_target && bbr->pacing_gain < NGX_QUIC_BBR_SCALE
++        && ngx_quic_bbr_gain_cycle[bbr->cycle_index] == NGX_QUIC_BBR_SCALE
++        && qc->congestion.in_flight
++           > ngx_quic_bbr_target_cwnd(bbr, NGX_QUIC_BBR_SCALE))
++    {
++        return;
++    }
++
++    bbr->pacing_gain = ngx_quic_bbr_gain_cycle[bbr->cycle_index];
++}
++
++
++static void
++ngx_quic_bbr_update_recovery_state(ngx_quic_bbr_t *bbr,
++    ngx_quic_sample_t *sample, ngx_uint_t has_losses)
++{
++    if (!bbr->is_at_full_bandwidth) {
++        return;
++    }
++
++    if (has_losses) {
++        if (bbr->last_sent_packet != NGX_QUIC_SAMPLER_INVALID_PNUM) {
++            bbr->end_recovery_at = bbr->last_sent_packet;
++        }
++    }
++
++    switch (bbr->recovery_state) {
++    case NGX_QUIC_BBR_RECOVERY_NONE:
++        if (has_losses) {
++            bbr->recovery_state = NGX_QUIC_BBR_RECOVERY_CONSERVATION;
++            bbr->recovery_window = 0;
++            bbr->current_round_end = bbr->last_sent_packet;
++        }
++        break;
++
++    case NGX_QUIC_BBR_RECOVERY_CONSERVATION:
++        if (sample->round_start
++            || (bbr->current_round_end != NGX_QUIC_SAMPLER_INVALID_PNUM
++                && sample->largest_acked > bbr->current_round_end))
++        {
++            bbr->recovery_state = NGX_QUIC_BBR_RECOVERY_GROWTH;
++            bbr->current_round_end = NGX_QUIC_SAMPLER_INVALID_PNUM;
++        }
++        /* fall through */
++
++    case NGX_QUIC_BBR_RECOVERY_GROWTH:
++        if (!has_losses
++            && bbr->end_recovery_at != NGX_QUIC_SAMPLER_INVALID_PNUM
++            && sample->largest_acked > bbr->end_recovery_at)
++        {
++            bbr->recovery_state = NGX_QUIC_BBR_RECOVERY_NONE;
++        }
++        break;
++    }
++}
++
++
++static void
++ngx_quic_bbr_calculate_pacing_rate(ngx_quic_bbr_t *bbr, size_t bytes_lost)
++{
++    uint64_t         min_rate, target;
++    ngx_msec_t      rtt;
++
++    if (bbr->max_bw == 0) {
++        return;
++    }
++
++    target = ngx_quic_bbr_scale_bw(bbr->max_bw, bbr->pacing_gain);
++    target = ngx_max(target, NGX_QUIC_BBR_MIN_BW);
++
++    if (bbr->is_at_full_bandwidth) {
++        bbr->pacing_rate = target;
++        return;
++    }
++
++    if (bbr->detect_overshooting && bytes_lost != 0) {
++        bbr->bytes_lost_while_detecting_overshooting += bytes_lost;
++
++        if (bbr->pacing_rate > target
++            && (bbr->has_non_app_limited_sample
++                || bbr->bytes_lost_while_detecting_overshooting
++                   * bbr->bytes_lost_multiplier > bbr->initial_cwnd))
++        {
++            rtt = ngx_max(bbr->min_rtt == NGX_TIMER_INFINITE
++                          ? 0 : bbr->min_rtt, 1);
++            min_rate = bbr->cwnd_to_calculate_min_pacing_rate * 1000 / rtt;
++            bbr->pacing_rate = ngx_max(target, min_rate);
++            bbr->bytes_lost_while_detecting_overshooting = 0;
++            bbr->detect_overshooting = 0;
++        }
++    }
++
++    bbr->pacing_rate = ngx_max(bbr->pacing_rate, target);
++}
++
++
++static void
++ngx_quic_bbr_calculate_cwnd(ngx_connection_t *c, ngx_quic_bbr_t *bbr,
++    ngx_quic_sample_t *sample)
++{
++    size_t  target;
++
++    if (sample->acked_bytes == 0 || bbr->mode == NGX_QUIC_BBR_PROBE_RTT) {
++        return;
++    }
++
++    target = ngx_quic_bbr_target_cwnd(bbr, bbr->congestion_window_gain);
++
++    if (bbr->is_at_full_bandwidth) {
++        target = ngx_quic_bbr_add_window(target,
++                  ngx_quic_sampler_max_ack_height(c, bbr->round_count));
++
++    } else if (bbr->enable_ack_aggregation_startup) {
++        target = ngx_quic_bbr_add_window(target, sample->extra_acked);
++    }
++
++    if (bbr->is_at_full_bandwidth) {
++        bbr->cwnd = ngx_min(target, ngx_quic_bbr_add_window(bbr->cwnd,
++                                                            sample->acked_bytes));
++
++    } else if (bbr->cwnd < target
++               || ngx_quic_sampler_total_acked(c) < bbr->initial_cwnd)
++    {
++        bbr->cwnd = ngx_quic_bbr_add_window(bbr->cwnd, sample->acked_bytes);
++    }
++
++    bbr->cwnd = ngx_quic_bbr_clamp_cwnd(bbr, bbr->cwnd);
++}
++
++
++static void
++ngx_quic_bbr_calculate_recovery_window(ngx_quic_bbr_t *bbr,
++    size_t bytes_acked, size_t bytes_lost, size_t bytes_in_flight)
++{
++    if (bbr->recovery_state == NGX_QUIC_BBR_RECOVERY_NONE) {
++        return;
++    }
++
++    if (bbr->recovery_window == 0) {
++        bbr->recovery_window = ngx_max(bbr->min_cwnd,
++            ngx_quic_bbr_add_window(bytes_in_flight, bytes_acked));
++        return;
++    }
++
++    if (bbr->recovery_window >= bytes_lost) {
++        bbr->recovery_window -= bytes_lost;
++
++    } else {
++        bbr->recovery_window = bbr->max_datagram;
++    }
++
++    if (bbr->recovery_state == NGX_QUIC_BBR_RECOVERY_GROWTH) {
++        bbr->recovery_window =
++            ngx_quic_bbr_add_window(bbr->recovery_window, bytes_acked);
++    }
++
++    bbr->recovery_window = ngx_max(bbr->recovery_window,
++        ngx_quic_bbr_add_window(bytes_in_flight, bytes_acked));
++    bbr->recovery_window = ngx_quic_bbr_clamp_cwnd(bbr,
++                                                   bbr->recovery_window);
++}
++
++
++static void
++ngx_quic_bbr_update_control(ngx_connection_t *c, ngx_quic_sample_t *sample,
++    ngx_msec_t now, ngx_uint_t has_losses)
++{
++    ngx_uint_t              is_new_max, min_rtt_expired;
++    ngx_quic_bbr_t         *bbr;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    bbr = qc->cc.ctx;
++
++    ngx_quic_bbr_maybe_app_limited(c, bbr, sample->prior_in_flight);
++
++    min_rtt_expired = bbr->min_rtt != NGX_TIMER_INFINITE
++                      && now - bbr->min_rtt_stamp
++                         > NGX_QUIC_BBR_MIN_RTT_EXPIRY;
++
++    if (sample->sample_rtt != 0
++        && (bbr->min_rtt == NGX_TIMER_INFINITE
++            || sample->sample_rtt < bbr->min_rtt
++            || min_rtt_expired))
++    {
++        bbr->min_rtt = sample->sample_rtt;
++        bbr->min_rtt_stamp = now;
++    }
++
++    if (sample->last_packet_state.valid) {
++        bbr->last_sample_is_app_limited =
++            sample->last_packet_state.app_limited;
++
++        if (!bbr->last_sample_is_app_limited) {
++            bbr->has_non_app_limited_sample = 1;
++        }
++    }
++
++    if (sample->round_start) {
++        bbr->round_count++;
++        bbr->num_loss_events_in_round = 0;
++        bbr->bytes_lost_in_round = 0;
++    }
++
++    if (has_losses) {
++        bbr->num_loss_events_in_round++;
++        bbr->bytes_lost_in_round += sample->lost_bytes;
++    }
++
++    is_new_max = ngx_quic_bbr_update_bw(bbr, sample);
++    sample->extra_acked = ngx_quic_sampler_update_ack_height(c,
++                         bbr->max_bw, is_new_max, bbr->round_count, now);
++
++    if (sample->round_start
++        && bbr->mode == NGX_QUIC_BBR_STARTUP
++        && !bbr->is_at_full_bandwidth)
++    {
++        ngx_quic_bbr_check_full_bw(c, bbr, sample);
++    }
++
++    ngx_quic_bbr_update_recovery_state(bbr, sample, has_losses);
++    ngx_quic_bbr_update_gain_cycle(c, bbr, now, sample->prior_in_flight,
++                                   has_losses);
++    ngx_quic_bbr_maybe_exit_startup_or_drain(c, bbr, now);
++    ngx_quic_bbr_maybe_probe_rtt(c, bbr, sample, now, min_rtt_expired);
++    ngx_quic_bbr_calculate_pacing_rate(bbr, sample->lost_bytes);
++    ngx_quic_bbr_calculate_cwnd(c, bbr, sample);
++    ngx_quic_bbr_calculate_recovery_window(bbr, sample->acked_bytes,
++                                           sample->lost_bytes,
++                                           qc->congestion.in_flight);
++
++    qc->congestion.window = ngx_quic_bbr_get_cwnd(c);
++
++    ngx_log_debug8(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic bbr event mode:%ui profile:%ui rate:%uL bw:%uL"
++                   " cwnd:%uz if:%uz rtt:%M round:%uL",
++                   bbr->mode, bbr->profile, bbr->pacing_rate, bbr->max_bw,
++                   qc->congestion.window, qc->congestion.in_flight,
++                   bbr->min_rtt, bbr->round_count);
++}
++
++
++static uint64_t
++ngx_quic_bbr_scale_bw(uint64_t bw, ngx_uint_t gain)
++{
++    if (bw > (uint64_t) -1 / gain) {
++        return (uint64_t) -1 / NGX_QUIC_BBR_SCALE;
++    }
++
++    return bw * gain / NGX_QUIC_BBR_SCALE;
++}
++
++
++static uint64_t
++ngx_quic_bbr_rate(ngx_quic_bbr_t *bbr)
++{
++    return ngx_max(bbr->pacing_rate, NGX_QUIC_BBR_MIN_BW);
++}
++
++
++static size_t
++ngx_quic_bbr_rescale_window(size_t window, size_t old_size, size_t new_size)
++{
++    uint64_t  scaled;
++
++    if (old_size == 0 || old_size == new_size) {
++        return window;
++    }
++
++    if ((uint64_t) window > (uint64_t) NGX_MAX_SIZE_T_VALUE / new_size) {
++        return NGX_MAX_SIZE_T_VALUE;
++    }
++
++    scaled = (uint64_t) window * new_size / old_size;
++
++    return (scaled > NGX_MAX_SIZE_T_VALUE) ? NGX_MAX_SIZE_T_VALUE
++                                           : (size_t) scaled;
++}
++
++
++static size_t
++ngx_quic_bbr_clamp_cwnd(ngx_quic_bbr_t *bbr, size_t cwnd)
++{
++    cwnd = ngx_max(cwnd, bbr->min_cwnd);
++    cwnd = ngx_min(cwnd, bbr->max_cwnd);
++
++    return cwnd;
++}
++
++
++static size_t
++ngx_quic_bbr_add_window(size_t a, size_t b)
++{
++    if (a > NGX_MAX_SIZE_T_VALUE - b) {
++        return NGX_MAX_SIZE_T_VALUE;
++    }
++
++    return a + b;
++}
+diff --git a/src/event/quic/ngx_event_quic_bbr.h b/src/event/quic/ngx_event_quic_bbr.h
+new file mode 100644
+index 0000000..d5d5852
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_bbr.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#ifndef _NGX_EVENT_QUIC_BBR_H_INCLUDED_
++#define _NGX_EVENT_QUIC_BBR_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event_quic_cc.h>
++
++
++extern const ngx_quic_cc_ops_t  ngx_quic_bbr_ops;
++
++
++#endif /* _NGX_EVENT_QUIC_BBR_H_INCLUDED_ */
+diff --git a/src/event/quic/ngx_event_quic_brutal.c b/src/event/quic/ngx_event_quic_brutal.c
+new file mode 100644
+index 0000000..28c84a8
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_brutal.c
+@@ -0,0 +1,351 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_event_quic_connection.h>
++
++
++#define NGX_QUIC_BRUTAL_SLOTS          5
++#define NGX_QUIC_BRUTAL_MIN_SAMPLES   50
++#define NGX_QUIC_BRUTAL_MIN_ACK_RATE  800
++
++
++typedef struct {
++    ngx_msec_t                        sec;
++    ngx_uint_t                        acked;
++    ngx_uint_t                        lost;
++} ngx_quic_brutal_slot_t;
++
++
++typedef struct {
++    uint64_t                          base_rate;
++    uint64_t                          pacing_rate;
++    ngx_uint_t                        ack_rate;
++    size_t                            cwnd;
++    ngx_quic_brutal_slot_t            slots[NGX_QUIC_BRUTAL_SLOTS];
++} ngx_quic_brutal_t;
++
++
++static ngx_int_t ngx_quic_brutal_init(ngx_connection_t *c);
++static void ngx_quic_brutal_reset_path(ngx_connection_t *c);
++static ngx_uint_t ngx_quic_brutal_can_send(ngx_connection_t *c,
++    size_t bytes_in_flight);
++static ngx_uint_t ngx_quic_brutal_has_pacing_budget(ngx_connection_t *c,
++    ngx_msec_t now);
++static size_t ngx_quic_brutal_pacing_budget(ngx_connection_t *c,
++    ngx_msec_t now);
++static ngx_msec_t ngx_quic_brutal_time_until_send(ngx_connection_t *c,
++    ngx_msec_t now);
++static void ngx_quic_brutal_on_packet_sent(ngx_connection_t *c,
++    ngx_quic_frame_t *f);
++static void ngx_quic_brutal_on_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now);
++static size_t ngx_quic_brutal_get_cwnd(ngx_connection_t *c);
++static void ngx_quic_brutal_set_max_datagram_size(ngx_connection_t *c,
++    size_t max_datagram);
++static void ngx_quic_brutal_on_persistent_congestion(ngx_connection_t *c);
++static void ngx_quic_brutal_init_state(ngx_connection_t *c,
++    ngx_quic_brutal_t *br);
++static void ngx_quic_brutal_update_rate(ngx_connection_t *c,
++    ngx_quic_brutal_t *br);
++static void ngx_quic_brutal_update_ack_rate(ngx_connection_t *c,
++    ngx_quic_brutal_t *br, ngx_quic_sample_t *sample, ngx_msec_t now);
++
++
++const ngx_quic_cc_ops_t  ngx_quic_brutal_ops = {
++    ngx_quic_brutal_init,
++    ngx_quic_brutal_reset_path,
++    ngx_quic_brutal_can_send,
++    ngx_quic_brutal_has_pacing_budget,
++    ngx_quic_brutal_pacing_budget,
++    ngx_quic_brutal_time_until_send,
++    ngx_quic_brutal_on_packet_sent,
++    ngx_quic_brutal_on_event,
++    ngx_quic_brutal_on_event,
++    ngx_quic_brutal_on_event,
++    ngx_quic_brutal_get_cwnd,
++    ngx_quic_brutal_set_max_datagram_size,
++    ngx_quic_brutal_on_persistent_congestion
++};
++
++
++static ngx_int_t
++ngx_quic_brutal_init(ngx_connection_t *c)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    br = ngx_pcalloc(c->pool, sizeof(ngx_quic_brutal_t));
++    if (br == NULL) {
++        return NGX_ERROR;
++    }
++
++    qc->cc.ctx = br;
++    ngx_quic_brutal_init_state(c, br);
++
++    return NGX_OK;
++}
++
++
++static void
++ngx_quic_brutal_reset_path(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    ngx_quic_brutal_init_state(c, qc->cc.ctx);
++}
++
++
++static ngx_uint_t
++ngx_quic_brutal_can_send(ngx_connection_t *c, size_t bytes_in_flight)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    return bytes_in_flight < br->cwnd;
++}
++
++
++static ngx_uint_t
++ngx_quic_brutal_has_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    return ngx_quic_pacer_budget(&qc->cc.pacer, br->pacing_rate, now)
++           >= qc->path->mtu;
++}
++
++
++static size_t
++ngx_quic_brutal_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    return ngx_quic_pacer_budget(&qc->cc.pacer, br->pacing_rate, now);
++}
++
++
++static ngx_msec_t
++ngx_quic_brutal_time_until_send(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    return ngx_quic_pacer_time_until_send(&qc->cc.pacer, br->pacing_rate, now);
++}
++
++
++static void
++ngx_quic_brutal_on_packet_sent(ngx_connection_t *c, ngx_quic_frame_t *f)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    ngx_quic_pacer_sent(&qc->cc.pacer, br->pacing_rate, f->send_time, f->plen);
++}
++
++
++/* ack/loss/congestion 三类事件处理一致：更新 ack 速率后重算发送速率 */
++static void
++ngx_quic_brutal_on_event(ngx_connection_t *c, ngx_quic_sample_t *sample,
++    ngx_msec_t now)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    ngx_quic_brutal_update_ack_rate(c, br, sample, now);
++    ngx_quic_brutal_update_rate(c, br);
++}
++
++
++static size_t
++ngx_quic_brutal_get_cwnd(ngx_connection_t *c)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    return br->cwnd;
++}
++
++
++static void
++ngx_quic_brutal_set_max_datagram_size(ngx_connection_t *c, size_t max_datagram)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    ngx_quic_pacer_set_max_datagram(&qc->cc.pacer, max_datagram);
++    ngx_quic_brutal_update_rate(c, br);
++}
++
++
++static void
++ngx_quic_brutal_on_persistent_congestion(ngx_connection_t *c)
++{
++    ngx_quic_brutal_t      *br;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    br = qc->cc.ctx;
++
++    br->cwnd = ngx_max(4 * qc->path->mtu, NGX_QUIC_MIN_INITIAL_SIZE);
++    qc->congestion.window = br->cwnd;
++}
++
++
++static void
++ngx_quic_brutal_init_state(ngx_connection_t *c, ngx_quic_brutal_t *br)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    ngx_memzero(br, sizeof(ngx_quic_brutal_t));
++
++    ngx_quic_cc_reset_default(c);
++
++    br->base_rate = qc->conf->brutal_up;
++    br->ack_rate = 1000;
++
++    ngx_quic_brutal_update_rate(c, br);
++    ngx_quic_pacer_init(&qc->cc.pacer, NGX_QUIC_MIN_INITIAL_SIZE);
++
++    ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic brutal init up:%uL rate:%uL cwnd:%uz",
++                   br->base_rate, br->pacing_rate, br->cwnd);
++}
++
++
++static void
++ngx_quic_brutal_update_rate(ngx_connection_t *c, ngx_quic_brutal_t *br)
++{
++    uint64_t                cwnd, rtt;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    br->pacing_rate = br->base_rate;
++
++    if (qc->conf->brutal_compensate_loss && br->ack_rate != 0) {
++        if (br->base_rate > (uint64_t) -1 / 1000) {
++            br->pacing_rate = (uint64_t) -1 / br->ack_rate;
++
++        } else {
++            br->pacing_rate = br->base_rate * 1000 / br->ack_rate;
++        }
++    }
++
++    rtt = ngx_max(qc->avg_rtt, 1);
++
++    if (br->pacing_rate > (uint64_t) NGX_MAX_SIZE_T_VALUE / rtt) {
++        cwnd = NGX_MAX_SIZE_T_VALUE;
++
++    } else {
++        cwnd = br->pacing_rate * rtt / 1000;
++        cwnd = (cwnd > (uint64_t) NGX_MAX_SIZE_T_VALUE / 2)
++               ? NGX_MAX_SIZE_T_VALUE : cwnd * 2;
++    }
++
++    cwnd = ngx_max(cwnd, 4 * qc->path->mtu);
++    cwnd = ngx_min(cwnd, NGX_MAX_SIZE_T_VALUE);
++
++    br->cwnd = (size_t) cwnd;
++    qc->congestion.window = br->cwnd;
++
++    ngx_log_debug6(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic brutal rate up:%uL rate:%uL ack:%ui"
++                   " cwnd:%uz rtt:%M if:%uz",
++                   br->base_rate, br->pacing_rate, br->ack_rate, br->cwnd,
++                   qc->avg_rtt, qc->congestion.in_flight);
++}
++
++
++static void
++ngx_quic_brutal_update_ack_rate(ngx_connection_t *c, ngx_quic_brutal_t *br,
++    ngx_quic_sample_t *sample, ngx_msec_t now)
++{
++    ngx_msec_t                sec, min;
++    ngx_uint_t                i, acked, lost, total, slot;
++    ngx_quic_brutal_slot_t   *bs;
++    ngx_quic_connection_t    *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    if (!qc->conf->brutal_compensate_loss) {
++        br->ack_rate = 1000;
++        return;
++    }
++
++    sec = now / 1000;
++    slot = sec % NGX_QUIC_BRUTAL_SLOTS;
++    bs = &br->slots[slot];
++
++    if (bs->sec != sec) {
++        ngx_memzero(bs, sizeof(ngx_quic_brutal_slot_t));
++        bs->sec = sec;
++    }
++
++    bs->acked += sample->acked_packets;
++    bs->lost += sample->lost_packets;
++
++    acked = 0;
++    lost = 0;
++    min = (sec > NGX_QUIC_BRUTAL_SLOTS) ? sec - NGX_QUIC_BRUTAL_SLOTS : 0;
++
++    for (i = 0; i < NGX_QUIC_BRUTAL_SLOTS; i++) {
++        if (br->slots[i].sec < min) {
++            continue;
++        }
++
++        acked += br->slots[i].acked;
++        lost += br->slots[i].lost;
++    }
++
++    total = acked + lost;
++
++    if (total < NGX_QUIC_BRUTAL_MIN_SAMPLES) {
++        br->ack_rate = 1000;
++        return;
++    }
++
++    br->ack_rate = acked * 1000 / total;
++    br->ack_rate = ngx_max(br->ack_rate, NGX_QUIC_BRUTAL_MIN_ACK_RATE);
++
++    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic brutal ack-rate acked:%ui lost:%ui total:%ui rate:%ui",
++                   acked, lost, total, br->ack_rate);
++}
+diff --git a/src/event/quic/ngx_event_quic_brutal.h b/src/event/quic/ngx_event_quic_brutal.h
+new file mode 100644
+index 0000000..044f915
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_brutal.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#ifndef _NGX_EVENT_QUIC_BRUTAL_H_INCLUDED_
++#define _NGX_EVENT_QUIC_BRUTAL_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event_quic_cc.h>
++
++
++extern const ngx_quic_cc_ops_t  ngx_quic_brutal_ops;
++
++
++#endif /* _NGX_EVENT_QUIC_BRUTAL_H_INCLUDED_ */
+diff --git a/src/event/quic/ngx_event_quic_cc.c b/src/event/quic/ngx_event_quic_cc.c
+new file mode 100644
+index 0000000..5389da9
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_cc.c
+@@ -0,0 +1,477 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_event_quic_connection.h>
++
++
++static ngx_int_t ngx_quic_cc_default_init(ngx_connection_t *c);
++static void ngx_quic_cc_default_reset_path(ngx_connection_t *c);
++static ngx_uint_t ngx_quic_cc_default_can_send(ngx_connection_t *c,
++    size_t bytes_in_flight);
++static ngx_uint_t ngx_quic_cc_default_has_pacing_budget(ngx_connection_t *c,
++    ngx_msec_t now);
++static size_t ngx_quic_cc_default_pacing_budget(ngx_connection_t *c,
++    ngx_msec_t now);
++static ngx_msec_t ngx_quic_cc_default_time_until_send(ngx_connection_t *c,
++    ngx_msec_t now);
++static void ngx_quic_cc_default_on_packet_sent(ngx_connection_t *c,
++    ngx_quic_frame_t *f);
++static void ngx_quic_cc_default_on_ack_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now);
++static void ngx_quic_cc_default_on_loss_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now);
++static void ngx_quic_cc_default_on_congestion_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now);
++static size_t ngx_quic_cc_default_get_cwnd(ngx_connection_t *c);
++static void ngx_quic_cc_default_set_max_datagram_size(ngx_connection_t *c,
++    size_t max_datagram);
++static void ngx_quic_cc_default_on_persistent_congestion(ngx_connection_t *c);
++static size_t ngx_quic_pacer_max_burst(ngx_quic_pacer_t *p, uint64_t rate);
++
++
++const ngx_quic_cc_ops_t  ngx_quic_cc_default_ops = {
++    ngx_quic_cc_default_init,
++    ngx_quic_cc_default_reset_path,
++    ngx_quic_cc_default_can_send,
++    ngx_quic_cc_default_has_pacing_budget,
++    ngx_quic_cc_default_pacing_budget,
++    ngx_quic_cc_default_time_until_send,
++    ngx_quic_cc_default_on_packet_sent,
++    ngx_quic_cc_default_on_ack_event,
++    ngx_quic_cc_default_on_loss_event,
++    ngx_quic_cc_default_on_congestion_event,
++    ngx_quic_cc_default_get_cwnd,
++    ngx_quic_cc_default_set_max_datagram_size,
++    ngx_quic_cc_default_on_persistent_congestion
++};
++
++
++ngx_int_t
++ngx_quic_cc_init(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    if (qc == NULL) {
++        return NGX_ERROR;
++    }
++
++    switch (qc->conf->congestion) {
++    case NGX_QUIC_CONGESTION_BBR:
++        qc->cc.ops = &ngx_quic_bbr_ops;
++        break;
++
++    case NGX_QUIC_CONGESTION_BRUTAL:
++        qc->cc.ops = &ngx_quic_brutal_ops;
++        break;
++
++    default:
++        qc->cc.ops = &ngx_quic_cc_default_ops;
++        break;
++    }
++
++    if (ngx_quic_cc_is_default(c)) {
++        ngx_quic_pacer_init(&qc->cc.pacer, NGX_QUIC_MIN_INITIAL_SIZE);
++
++    } else if (ngx_quic_sampler_init(c) != NGX_OK) {
++        /* sampler 分配失败必须终止连接，避免后续空指针解引用 */
++        return NGX_ERROR;
++    }
++
++    ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic congestion selected alg:%ui bbr:%ui brutal:%uz",
++                   qc->conf->congestion, qc->conf->bbr_profile,
++                   qc->conf->brutal_up);
++
++    return qc->cc.ops->init(c);
++}
++
++
++void
++ngx_quic_cc_reset_path(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    if (qc == NULL) {
++        return;
++    }
++
++    if (ngx_quic_cc_is_default(c)) {
++        ngx_quic_pacer_init(&qc->cc.pacer, NGX_QUIC_MIN_INITIAL_SIZE);
++
++    } else {
++        /* pacer 由各算法自身的 reset_path 以正确参数重新初始化 */
++        ngx_quic_sampler_reset_path(c);
++    }
++
++    if (qc->cc.ops && qc->cc.ops->reset_path) {
++        qc->cc.ops->reset_path(c);
++    }
++
++    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic congestion reset path alg:%ui",
++                   qc->conf->congestion);
++}
++
++
++ngx_uint_t
++ngx_quic_cc_is_default(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->cc.ops == NULL || qc->cc.ops == &ngx_quic_cc_default_ops;
++}
++
++
++ngx_uint_t
++ngx_quic_cc_can_send(ngx_connection_t *c, size_t bytes_in_flight)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->cc.ops->can_send(c, bytes_in_flight);
++}
++
++
++ngx_uint_t
++ngx_quic_cc_has_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->cc.ops->has_pacing_budget(c, now);
++}
++
++
++size_t
++ngx_quic_cc_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->cc.ops->pacing_budget(c, now);
++}
++
++
++ngx_msec_t
++ngx_quic_cc_time_until_send(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->cc.ops->time_until_send(c, now);
++}
++
++
++size_t
++ngx_quic_cc_get_cwnd(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->cc.ops->get_cwnd(c);
++}
++
++
++void
++ngx_quic_cc_on_packet_sent(ngx_connection_t *c, ngx_quic_frame_t *f)
++{
++    ngx_quic_connection_t  *qc;
++
++    if (f->plen == 0) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++
++    if (qc->cc.pacer.max_datagram != qc->path->mtu) {
++        ngx_quic_pacer_set_max_datagram(&qc->cc.pacer, qc->path->mtu);
++        qc->cc.ops->set_max_datagram_size(c, qc->path->mtu);
++    }
++
++    if (!ngx_quic_cc_is_default(c)) {
++        ngx_quic_sampler_on_packet_sent(c, f);
++    }
++
++    qc->cc.ops->on_packet_sent(c, f);
++}
++
++
++void
++ngx_quic_cc_on_congestion_event(ngx_connection_t *c, ngx_quic_sample_t *sample,
++    size_t prior_in_flight, ngx_msec_t now)
++{
++    ngx_quic_connection_t  *qc;
++
++    if (sample->acked_bytes == 0 && sample->lost_bytes == 0) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++
++    sample->prior_in_flight = prior_in_flight;
++    qc->cc.ops->on_congestion_event(c, sample, now);
++}
++
++
++void
++ngx_quic_cc_on_persistent_congestion(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    qc->cc.ops->on_persistent_congestion(c);
++}
++
++
++void
++ngx_quic_pacer_init(ngx_quic_pacer_t *p, size_t max_datagram)
++{
++    ngx_memzero(p, sizeof(ngx_quic_pacer_t));
++    p->max_datagram = max_datagram;
++    p->budget = max_datagram * 10;
++}
++
++
++void
++ngx_quic_pacer_set_max_datagram(ngx_quic_pacer_t *p, size_t max_datagram)
++{
++    p->max_datagram = max_datagram;
++}
++
++
++size_t
++ngx_quic_pacer_budget(ngx_quic_pacer_t *p, uint64_t rate, ngx_msec_t now)
++{
++    uint64_t    added, elapsed, budget, burst;
++
++    burst = ngx_quic_pacer_max_burst(p, rate);
++
++    if (p->last == 0) {
++        p->budget = burst;
++        return p->budget;
++    }
++
++    elapsed = now - p->last;
++
++    if (elapsed != 0 && rate > (uint64_t) -1 / elapsed) {
++        added = (uint64_t) NGX_MAX_SIZE_T_VALUE;
++
++    } else {
++        added = rate * elapsed / 1000;
++    }
++
++    budget = p->budget + added;
++
++    if (budget < p->budget || budget > burst) {
++        budget = burst;
++    }
++
++    p->budget = (size_t) budget;
++
++    return p->budget;
++}
++
++
++void
++ngx_quic_pacer_sent(ngx_quic_pacer_t *p, uint64_t rate, ngx_msec_t now,
++    size_t bytes)
++{
++    size_t  budget;
++
++    budget = ngx_quic_pacer_budget(p, rate, now);
++
++    p->budget = (bytes >= budget) ? 0 : budget - bytes;
++    p->last = now;
++}
++
++
++ngx_msec_t
++ngx_quic_pacer_time_until_send(ngx_quic_pacer_t *p, uint64_t rate,
++    ngx_msec_t now)
++{
++    uint64_t  delay, need;
++
++    if (ngx_quic_pacer_budget(p, rate, now) >= p->max_datagram) {
++        return 0;
++    }
++
++    if (rate == 0) {
++        return 1;
++    }
++
++    need = p->max_datagram - p->budget;
++
++    if (need > ((uint64_t) -1 - rate + 1) / 1000) {
++        return NGX_TIMER_INFINITE;
++    }
++
++    delay = (need * 1000 + rate - 1) / rate;
++
++    return ngx_max(delay, 1);
++}
++
++
++void
++ngx_quic_cc_reset_default(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    if (qc == NULL) {
++        return;
++    }
++
++    ngx_memzero(&qc->congestion, sizeof(ngx_quic_congestion_t));
++
++    qc->congestion.window = ngx_min(10 * NGX_QUIC_MIN_INITIAL_SIZE,
++                                    ngx_max(2 * NGX_QUIC_MIN_INITIAL_SIZE,
++                                            14720));
++    qc->congestion.ssthresh = (size_t) -1;
++    qc->congestion.mtu = NGX_QUIC_MIN_INITIAL_SIZE;
++    qc->congestion.recovery_start = ngx_current_msec - 1;
++}
++
++
++static ngx_int_t
++ngx_quic_cc_default_init(ngx_connection_t *c)
++{
++    return NGX_OK;
++}
++
++
++static void
++ngx_quic_cc_default_reset_path(ngx_connection_t *c)
++{
++    ngx_quic_cc_reset_default(c);
++}
++
++
++static ngx_uint_t
++ngx_quic_cc_default_can_send(ngx_connection_t *c, size_t bytes_in_flight)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return bytes_in_flight < qc->congestion.window;
++}
++
++
++static ngx_uint_t
++ngx_quic_cc_default_has_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    return 1;
++}
++
++
++static size_t
++ngx_quic_cc_default_pacing_budget(ngx_connection_t *c, ngx_msec_t now)
++{
++    return NGX_MAX_SIZE_T_VALUE;
++}
++
++
++static ngx_msec_t
++ngx_quic_cc_default_time_until_send(ngx_connection_t *c, ngx_msec_t now)
++{
++    return 0;
++}
++
++
++static void
++ngx_quic_cc_default_on_packet_sent(ngx_connection_t *c, ngx_quic_frame_t *f)
++{
++}
++
++
++static void
++ngx_quic_cc_default_on_ack_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now)
++{
++}
++
++
++static void
++ngx_quic_cc_default_on_loss_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now)
++{
++}
++
++
++static void
++ngx_quic_cc_default_on_congestion_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, ngx_msec_t now)
++{
++}
++
++
++static size_t
++ngx_quic_cc_default_get_cwnd(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->congestion.window;
++}
++
++
++static void
++ngx_quic_cc_default_set_max_datagram_size(ngx_connection_t *c,
++    size_t max_datagram)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    qc->congestion.mtu = max_datagram;
++}
++
++
++static void
++ngx_quic_cc_default_on_persistent_congestion(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    qc->congestion.mtu = qc->path->mtu;
++    qc->congestion.window = qc->congestion.mtu * 2;
++}
++
++
++static size_t
++ngx_quic_pacer_max_burst(ngx_quic_pacer_t *p, uint64_t rate)
++{
++    uint64_t  burst, packets;
++
++    packets = (p->max_datagram > NGX_MAX_SIZE_T_VALUE / 10)
++              ? NGX_MAX_SIZE_T_VALUE : p->max_datagram * 10;
++
++    burst = rate / 250;
++
++    if (burst < packets) {
++        burst = packets;
++    }
++
++    if (burst > NGX_MAX_SIZE_T_VALUE) {
++        return NGX_MAX_SIZE_T_VALUE;
++    }
++
++    return (size_t) burst;
++}
+diff --git a/src/event/quic/ngx_event_quic_cc.h b/src/event/quic/ngx_event_quic_cc.h
+new file mode 100644
+index 0000000..f138670
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_cc.h
+@@ -0,0 +1,87 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#ifndef _NGX_EVENT_QUIC_CC_H_INCLUDED_
++#define _NGX_EVENT_QUIC_CC_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event_quic_sampler.h>
++
++
++#ifndef NGX_QUIC_FRAME_T_DEFINED
++#define NGX_QUIC_FRAME_T_DEFINED
++typedef struct ngx_quic_frame_s        ngx_quic_frame_t;
++#endif
++
++
++typedef struct {
++    size_t                            budget;
++    ngx_msec_t                        last;
++    size_t                            max_datagram;
++} ngx_quic_pacer_t;
++
++
++typedef struct {
++    ngx_int_t   (*init)(ngx_connection_t *c);
++    void        (*reset_path)(ngx_connection_t *c);
++    ngx_uint_t  (*can_send)(ngx_connection_t *c, size_t bytes_in_flight);
++    ngx_uint_t  (*has_pacing_budget)(ngx_connection_t *c, ngx_msec_t now);
++    size_t      (*pacing_budget)(ngx_connection_t *c, ngx_msec_t now);
++    ngx_msec_t  (*time_until_send)(ngx_connection_t *c, ngx_msec_t now);
++    void        (*on_packet_sent)(ngx_connection_t *c, ngx_quic_frame_t *f);
++    void        (*on_ack_event)(ngx_connection_t *c,
++                                ngx_quic_sample_t *sample, ngx_msec_t now);
++    void        (*on_loss_event)(ngx_connection_t *c,
++                                 ngx_quic_sample_t *sample, ngx_msec_t now);
++    void        (*on_congestion_event)(ngx_connection_t *c,
++                                       ngx_quic_sample_t *sample,
++                                       ngx_msec_t now);
++    size_t      (*get_cwnd)(ngx_connection_t *c);
++    void        (*set_max_datagram_size)(ngx_connection_t *c,
++                                         size_t max_datagram);
++    void        (*on_persistent_congestion)(ngx_connection_t *c);
++} ngx_quic_cc_ops_t;
++
++
++typedef struct {
++    const ngx_quic_cc_ops_t          *ops;
++    void                            *ctx;
++    ngx_quic_pacer_t                 pacer;
++} ngx_quic_cc_t;
++
++
++ngx_int_t ngx_quic_cc_init(ngx_connection_t *c);
++void ngx_quic_cc_reset_path(ngx_connection_t *c);
++ngx_uint_t ngx_quic_cc_is_default(ngx_connection_t *c);
++ngx_uint_t ngx_quic_cc_can_send(ngx_connection_t *c, size_t bytes_in_flight);
++ngx_uint_t ngx_quic_cc_has_pacing_budget(ngx_connection_t *c, ngx_msec_t now);
++size_t ngx_quic_cc_pacing_budget(ngx_connection_t *c, ngx_msec_t now);
++ngx_msec_t ngx_quic_cc_time_until_send(ngx_connection_t *c, ngx_msec_t now);
++size_t ngx_quic_cc_get_cwnd(ngx_connection_t *c);
++void ngx_quic_cc_on_packet_sent(ngx_connection_t *c, ngx_quic_frame_t *f);
++void ngx_quic_cc_on_congestion_event(ngx_connection_t *c,
++    ngx_quic_sample_t *sample, size_t prior_in_flight, ngx_msec_t now);
++void ngx_quic_cc_on_persistent_congestion(ngx_connection_t *c);
++
++void ngx_quic_pacer_init(ngx_quic_pacer_t *p, size_t max_datagram);
++void ngx_quic_pacer_set_max_datagram(ngx_quic_pacer_t *p, size_t max_datagram);
++size_t ngx_quic_pacer_budget(ngx_quic_pacer_t *p, uint64_t rate,
++    ngx_msec_t now);
++void ngx_quic_pacer_sent(ngx_quic_pacer_t *p, uint64_t rate, ngx_msec_t now,
++    size_t bytes);
++ngx_msec_t ngx_quic_pacer_time_until_send(ngx_quic_pacer_t *p, uint64_t rate,
++    ngx_msec_t now);
++
++void ngx_quic_cc_reset_default(ngx_connection_t *c);
++
++
++extern const ngx_quic_cc_ops_t  ngx_quic_cc_default_ops;
++extern const ngx_quic_cc_ops_t  ngx_quic_bbr_ops;
++extern const ngx_quic_cc_ops_t  ngx_quic_brutal_ops;
++
++
++#endif /* _NGX_EVENT_QUIC_CC_H_INCLUDED_ */
+diff --git a/src/event/quic/ngx_event_quic_connection.h b/src/event/quic/ngx_event_quic_connection.h
+index efcb632..b38da39 100644
+--- a/src/event/quic/ngx_event_quic_connection.h
++++ b/src/event/quic/ngx_event_quic_connection.h
+@@ -40,6 +40,8 @@ typedef struct ngx_quic_keys_s        ngx_quic_keys_t;
+ #include <ngx_event_quic_transport.h>
+ #include <ngx_event_quic_protection.h>
+ #include <ngx_event_quic_frames.h>
++#include <ngx_event_quic_sampler.h>
++#include <ngx_event_quic_cc.h>
+ #include <ngx_event_quic_migration.h>
+ #include <ngx_event_quic_connid.h>
+ #include <ngx_event_quic_streams.h>
+@@ -127,6 +129,7 @@ struct ngx_quic_path_s {
+     u_char                            text[NGX_SOCKADDR_STRLEN];
+     unsigned                          validated:1;
+     unsigned                          mtu_unvalidated:1;
++    unsigned                          gso_disabled:1;
+ };
+ 
+ 
+@@ -280,6 +283,8 @@ struct ngx_quic_connection_s {
+ 
+     ngx_quic_streams_t                streams;
+     ngx_quic_congestion_t             congestion;
++    ngx_quic_sampler_t               *sampler;
++    ngx_quic_cc_t                     cc;
+ 
+     uint64_t                          rst_pnum;    /* first on validated path */
+ 
+diff --git a/src/event/quic/ngx_event_quic_migration.c b/src/event/quic/ngx_event_quic_migration.c
+index bbb1051..d2a5afb 100644
+--- a/src/event/quic/ngx_event_quic_migration.c
++++ b/src/event/quic/ngx_event_quic_migration.c
+@@ -180,19 +180,12 @@ valid:
+         ctx = ngx_quic_get_send_ctx(qc, NGX_QUIC_ENCRYPTION_APPLICATION);
+         qc->rst_pnum = ctx->pnum;
+ 
+-        ngx_memzero(&qc->congestion, sizeof(ngx_quic_congestion_t));
+-
+-        qc->congestion.window = ngx_min(10 * NGX_QUIC_MIN_INITIAL_SIZE,
+-                                   ngx_max(2 * NGX_QUIC_MIN_INITIAL_SIZE,
+-                                           14720));
+-        qc->congestion.ssthresh = (size_t) -1;
+-        qc->congestion.mtu = NGX_QUIC_MIN_INITIAL_SIZE;
+-        qc->congestion.recovery_start = ngx_current_msec - 1;
+-
++        ngx_quic_cc_reset_path(c);
+         ngx_quic_init_rtt(qc);
+     }
+ 
+     path->validated = 1;
++    path->gso_disabled = 0;
+ 
+     ngx_quic_set_connection_path(c, path);
+ 
+diff --git a/src/event/quic/ngx_event_quic_output.c b/src/event/quic/ngx_event_quic_output.c
+index f98c834..e5c7e67 100644
+--- a/src/event/quic/ngx_event_quic_output.c
++++ b/src/event/quic/ngx_event_quic_output.c
+@@ -48,11 +48,13 @@ static ngx_int_t ngx_quic_create_datagrams(ngx_connection_t *c);
+ static void ngx_quic_commit_send(ngx_connection_t *c);
+ static void ngx_quic_revert_send(ngx_connection_t *c,
+     uint64_t preserved_pnum[NGX_QUIC_SEND_CTX_LAST]);
++static void ngx_quic_set_pacing_timer(ngx_connection_t *c, ngx_msec_t now);
+ #if ((NGX_HAVE_UDP_SEGMENT) && (NGX_HAVE_MSGHDR_MSG_CONTROL))
+ static ngx_uint_t ngx_quic_allow_segmentation(ngx_connection_t *c);
+ static ngx_int_t ngx_quic_create_segments(ngx_connection_t *c);
+ static ssize_t ngx_quic_send_segments(ngx_connection_t *c, u_char *buf,
+     size_t len, struct sockaddr *sockaddr, socklen_t socklen, size_t segment);
++static ngx_uint_t ngx_quic_gso_error(ngx_err_t err);
+ #endif
+ static ssize_t ngx_quic_output_packet(ngx_connection_t *c,
+     ngx_quic_send_ctx_t *ctx, u_char *data, size_t max, size_t min,
+@@ -118,7 +120,8 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
+     ssize_t                 n;
+     u_char                 *p;
+     uint64_t                preserved_pnum[NGX_QUIC_SEND_CTX_LAST];
+-    ngx_uint_t              i, pad;
++    ngx_uint_t              i, pad, limited;
++    ngx_msec_t              now;
+     ngx_quic_path_t        *path;
+     ngx_quic_send_ctx_t    *ctx;
+     ngx_quic_congestion_t  *cg;
+@@ -135,6 +138,9 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
+ 
+     do {
+         p = dst;
++        now = ngx_current_msec;
++        limited = !ngx_quic_cc_can_send(c, cg->in_flight)
++                  || !ngx_quic_cc_has_pacing_budget(c, now);
+ 
+         len = ngx_quic_path_limit(c, path, path->mtu);
+ 
+@@ -159,8 +165,7 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
+                 return NGX_OK;
+             }
+ 
+-            n = ngx_quic_output_packet(c, ctx, p, len, min,
+-                                       cg->in_flight >= cg->window);
++            n = ngx_quic_output_packet(c, ctx, p, len, min, limited);
+             if (n == NGX_ERROR) {
+                 return NGX_ERROR;
+             }
+@@ -171,6 +176,10 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
+ 
+         len = p - dst;
+         if (len == 0) {
++            if (limited && ngx_quic_cc_can_send(c, cg->in_flight)) {
++                ngx_quic_set_pacing_timer(c, now);
++            }
++
+             break;
+         }
+ 
+@@ -190,7 +199,16 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
+ 
+         path->sent += len;
+ 
+-    } while (cg->in_flight < cg->window);
++    } while (ngx_quic_cc_can_send(c, cg->in_flight)
++             && ngx_quic_cc_has_pacing_budget(c, ngx_current_msec));
++
++    now = ngx_current_msec;
++
++    if (ngx_quic_cc_can_send(c, cg->in_flight)
++        && !ngx_quic_cc_has_pacing_budget(c, now))
++    {
++        ngx_quic_set_pacing_timer(c, now);
++    }
+ 
+     return NGX_OK;
+ }
+@@ -228,6 +246,7 @@ ngx_quic_commit_send(ngx_connection_t *c)
+             if (f->pkt_need_ack && !qc->closing) {
+                 ngx_queue_insert_tail(&ctx->sent, q);
+ 
++                ngx_quic_cc_on_packet_sent(c, f);
+                 cg->in_flight += f->plen;
+ 
+             } else {
+@@ -273,6 +292,28 @@ ngx_quic_revert_send(ngx_connection_t *c, uint64_t pnum[NGX_QUIC_SEND_CTX_LAST])
+ }
+ 
+ 
++static void
++ngx_quic_set_pacing_timer(ngx_connection_t *c, ngx_msec_t now)
++{
++    ngx_msec_t              delay;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    delay = ngx_quic_cc_time_until_send(c, now);
++
++    if (delay == NGX_TIMER_INFINITE) {
++        return;
++    }
++
++    if (delay == 0) {
++        delay = 1;
++    }
++
++    ngx_add_timer(&qc->push, delay);
++}
++
++
+ #if ((NGX_HAVE_UDP_SEGMENT) && (NGX_HAVE_MSGHDR_MSG_CONTROL))
+ 
+ static ngx_uint_t
+@@ -295,6 +336,14 @@ ngx_quic_allow_segmentation(ngx_connection_t *c)
+         return 0;
+     }
+ 
++    if (qc->path->gso_disabled) {
++        return 0;
++    }
++
++    if (!ngx_quic_cc_has_pacing_budget(c, ngx_current_msec)) {
++        return 0;
++    }
++
+     ctx = ngx_quic_get_send_ctx(qc, NGX_QUIC_ENCRYPTION_INITIAL);
+     if (!ngx_queue_empty(&ctx->frames)) {
+         return 0;
+@@ -318,11 +367,13 @@ ngx_quic_allow_segmentation(ngx_connection_t *c)
+ 
+         bytes += f->len;
+ 
+-        if (qc->congestion.in_flight + bytes >= qc->congestion.window) {
++        if (!ngx_quic_cc_can_send(c, qc->congestion.in_flight + bytes)) {
+             return 0;
+         }
+ 
+-        if (bytes > len * 3) {
++        if (bytes > len * 3
++            && ngx_quic_cc_pacing_budget(c, ngx_current_msec) >= bytes)
++        {
+             /* require at least ~3 full packets to batch */
+             return 1;
+         }
+@@ -369,7 +420,10 @@ ngx_quic_create_segments(ngx_connection_t *c)
+ 
+         len = ngx_min(segsize, (size_t) (end - p));
+ 
+-        if (len && cg->in_flight + (p - dst) < cg->window) {
++        if (len && ngx_quic_cc_can_send(c, cg->in_flight + (p - dst))
++            && ngx_quic_cc_pacing_budget(c, ngx_current_msec)
++               >= (size_t) (p - dst) + segsize)
++        {
+ 
+             n = ngx_quic_output_packet(c, ctx, p, len, len, 0);
+             if (n == NGX_ERROR) {
+@@ -393,6 +447,19 @@ ngx_quic_create_segments(ngx_connection_t *c)
+             n = ngx_quic_send_segments(c, dst, p - dst, path->sockaddr,
+                                        path->socklen, segsize);
+             if (n == NGX_ERROR) {
++                if (ngx_quic_gso_error(ngx_socket_errno)) {
++                    c->write->error = 0;
++                    path->gso_disabled = 1;
++                    ngx_quic_revert_send(c, preserved_pnum);
++
++                    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log,
++                                   ngx_socket_errno,
++                                   "quic gso disabled on path seq:%uL",
++                                   path->seqnum);
++
++                    return ngx_quic_create_datagrams(c);
++                }
++
+                 return NGX_ERROR;
+             }
+ 
+@@ -412,6 +479,12 @@ ngx_quic_create_segments(ngx_connection_t *c)
+         }
+     }
+ 
++    if (ngx_quic_cc_can_send(c, cg->in_flight)
++        && !ngx_quic_cc_has_pacing_budget(c, ngx_current_msec))
++    {
++        ngx_quic_set_pacing_timer(c, ngx_current_msec);
++    }
++
+     return NGX_OK;
+ }
+ 
+@@ -479,6 +552,25 @@ ngx_quic_send_segments(ngx_connection_t *c, u_char *buf, size_t len,
+     return n;
+ }
+ 
++
++static ngx_uint_t
++ngx_quic_gso_error(ngx_err_t err)
++{
++    if (err == NGX_EINVAL || err == NGX_EOPNOTSUPP
++        || err == NGX_ENOPROTOOPT)
++    {
++        return 1;
++    }
++
++#ifdef EIO
++    if (err == EIO) {
++        return 1;
++    }
++#endif
++
++    return 0;
++}
++
+ #endif
+ 
+ 
+@@ -1296,7 +1388,10 @@ ngx_quic_frame_sendto(ngx_connection_t *c, ngx_quic_frame_t *frame,
+                    "quic sendto %s packet max:%uz min:%uz",
+                    ngx_quic_level_name(ctx->level), max, min);
+ 
+-    if (cg->in_flight >= cg->window && !frame->ignore_congestion) {
++    if (!frame->ignore_congestion
++        && (!ngx_quic_cc_can_send(c, cg->in_flight)
++            || !ngx_quic_cc_has_pacing_budget(c, now)))
++    {
+         ngx_quic_free_frame(c, frame);
+         return NGX_AGAIN;
+     }
+@@ -1367,6 +1462,7 @@ ngx_quic_frame_sendto(ngx_connection_t *c, ngx_quic_frame_t *frame,
+     if (frame->need_ack && !qc->closing) {
+         ngx_queue_insert_tail(&ctx->sent, &frame->queue);
+ 
++        ngx_quic_cc_on_packet_sent(c, frame);
+         cg->in_flight += frame->plen;
+ 
+     } else {
+diff --git a/src/event/quic/ngx_event_quic_sampler.c b/src/event/quic/ngx_event_quic_sampler.c
+new file mode 100644
+index 0000000..ed50b5c
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_sampler.c
+@@ -0,0 +1,508 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_event_quic_connection.h>
++
++
++static uint64_t ngx_quic_sampler_rate(size_t bytes, ngx_msec_t delta);
++static size_t ngx_quic_sampler_add_size(size_t a, size_t b);
++static uint64_t ngx_quic_sampler_add(uint64_t a, uint64_t b);
++static uint64_t ngx_quic_sampler_mul_div(uint64_t value, uint64_t multiplier,
++    uint64_t divisor);
++static void ngx_quic_sampler_save_state(ngx_quic_frame_t *f,
++    ngx_quic_sample_send_state_t *state);
++static void ngx_quic_sampler_reset_state(ngx_connection_t *c);
++
++
++ngx_int_t
++ngx_quic_sampler_init(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    if (qc == NULL) {
++        return NGX_ERROR;
++    }
++
++    if (qc->sampler == NULL) {
++        qc->sampler = ngx_pcalloc(c->pool, sizeof(ngx_quic_sampler_t));
++        if (qc->sampler == NULL) {
++            return NGX_ERROR;
++        }
++    }
++
++    ngx_quic_sampler_reset_state(c);
++
++    return NGX_OK;
++}
++
++
++void
++ngx_quic_sampler_reset_path(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    /* cc_init 已保证 sampler 分配成功，此处仅重置状态 */
++    if (qc == NULL || qc->sampler == NULL) {
++        return;
++    }
++
++    ngx_quic_sampler_reset_state(c);
++}
++
++
++static void
++ngx_quic_sampler_reset_state(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    ngx_memzero(qc->sampler, sizeof(ngx_quic_sampler_t));
++
++    qc->sampler->last_sent_pnum = NGX_QUIC_SAMPLER_INVALID_PNUM;
++    qc->sampler->last_acked_pnum = NGX_QUIC_SAMPLER_INVALID_PNUM;
++    qc->sampler->next_round_pnum = NGX_QUIC_SAMPLER_INVALID_PNUM;
++    qc->sampler->end_app_limited_pnum = NGX_QUIC_SAMPLER_INVALID_PNUM;
++    qc->sampler->ack_height_threshold = 1000;
++}
++
++
++void
++ngx_quic_sampler_sample_init(ngx_quic_sample_t *sample)
++{
++    ngx_memzero(sample, sizeof(ngx_quic_sample_t));
++}
++
++
++void
++ngx_quic_sampler_on_packet_sent(ngx_connection_t *c, ngx_quic_frame_t *f)
++{
++    ngx_quic_sampler_t     *sampler;
++    ngx_quic_connection_t  *qc;
++
++    if (f->plen == 0) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++    sampler = qc->sampler;
++
++    sampler->last_sent_pnum = f->pnum;
++    sampler->total_bytes_sent += f->plen;
++
++    if (qc->congestion.in_flight == 0) {
++        sampler->last_acked_ack_time = f->send_time;
++        sampler->last_acked_sent_time = f->send_time;
++        sampler->total_bytes_sent_at_last_ack = sampler->total_bytes_sent;
++    }
++
++    f->sampler_total_sent = sampler->total_bytes_sent;
++    f->sampler_total_acked = sampler->total_bytes_acked;
++    f->sampler_total_lost = sampler->total_bytes_lost;
++    f->sampler_total_sent_at_last_ack =
++        sampler->total_bytes_sent_at_last_ack;
++    f->sampler_in_flight = qc->congestion.in_flight + f->plen;
++    f->sampler_delivered_time = sampler->last_acked_ack_time;
++    f->sampler_last_acked_sent_time = sampler->last_acked_sent_time;
++    f->sampler_last_acked_ack_time = sampler->last_acked_ack_time;
++    f->sampler_app_limited = sampler->app_limited;
++}
++
++
++void
++ngx_quic_sampler_on_packet_acked(ngx_connection_t *c, ngx_quic_frame_t *f,
++    ngx_quic_sample_t *sample)
++{
++    uint64_t                ack_rate, send_rate;
++    ngx_msec_t              now, ack_delta, send_delta, sample_rtt;
++    ngx_quic_sampler_t     *sampler;
++    ngx_quic_sample_send_state_t
++                            state;
++    ngx_quic_connection_t  *qc;
++
++    if (f->plen == 0) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++    sampler = qc->sampler;
++    now = ngx_current_msec;
++
++    sampler->total_bytes_acked += f->plen;
++
++    sample->acked_bytes = ngx_quic_sampler_add_size(sample->acked_bytes,
++                                                    f->plen);
++    sample->acked_packets++;
++
++    sample_rtt = now - f->send_time;
++    if (sample->sample_rtt == 0 || sample_rtt < sample->sample_rtt) {
++        sample->sample_rtt = sample_rtt;
++    }
++
++    if (sampler->app_limited
++        && (sampler->end_app_limited_pnum == NGX_QUIC_SAMPLER_INVALID_PNUM
++            || f->pnum > sampler->end_app_limited_pnum))
++    {
++        sampler->app_limited = 0;
++    }
++
++    if (sampler->next_round_pnum == NGX_QUIC_SAMPLER_INVALID_PNUM
++        || f->pnum > sampler->next_round_pnum)
++    {
++        sample->round_start = 1;
++        sampler->next_round_pnum = sampler->last_sent_pnum;
++    }
++
++    ack_delta = now - f->sampler_last_acked_ack_time;
++    send_delta = f->send_time - f->sampler_last_acked_sent_time;
++
++    ack_rate = ngx_quic_sampler_rate(
++        (size_t) (sampler->total_bytes_acked - f->sampler_total_acked),
++        ack_delta);
++
++    if (send_delta == 0) {
++        send_rate = (uint64_t) -1;
++
++    } else {
++        send_rate = ngx_quic_sampler_rate(
++            (size_t) (f->sampler_total_sent
++                      - f->sampler_total_sent_at_last_ack),
++            send_delta);
++    }
++
++    if (ack_rate != 0) {
++        ack_rate = (send_rate == (uint64_t) -1)
++                   ? ack_rate : ngx_min(send_rate, ack_rate);
++
++        if (ack_rate > sample->delivery_rate) {
++            sample->send_rate = send_rate;
++            sample->delivery_rate = ack_rate;
++        }
++    }
++
++    if (sample->acked_packets == 1 || f->pnum >= sample->largest_acked) {
++        sample->sample_is_app_limited = f->sampler_app_limited;
++        sample->largest_acked = f->pnum;
++
++        ngx_quic_sampler_save_state(f, &state);
++        sample->last_packet_state = state;
++    }
++
++    sampler->last_acked_pnum = f->pnum;
++    sampler->total_bytes_sent_at_last_ack = f->sampler_total_sent;
++    sampler->last_acked_sent_time = f->send_time;
++    sampler->last_acked_ack_time = now;
++
++    ngx_log_debug8(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic sampler ack pn:%uL rate:%uL send:%uL rtt:%M"
++                   " acked:%uz if:%uz round:%ui app:%ui",
++                   f->pnum, sample->delivery_rate, sample->send_rate,
++                   sample->sample_rtt, sample->acked_bytes,
++                   f->sampler_in_flight, sample->round_start,
++                   sample->sample_is_app_limited);
++}
++
++
++void
++ngx_quic_sampler_on_packet_lost(ngx_connection_t *c, ngx_quic_frame_t *f,
++    ngx_quic_sample_t *sample)
++{
++    ngx_msec_t              sample_rtt;
++    ngx_quic_sampler_t     *sampler;
++    ngx_quic_sample_send_state_t
++                            state;
++    ngx_quic_connection_t  *qc;
++
++    if (f->plen == 0) {
++        return;
++    }
++
++    qc = ngx_quic_get_connection(c);
++    sampler = qc->sampler;
++
++    sampler->total_bytes_lost += f->plen;
++
++    sample->lost_bytes = ngx_quic_sampler_add_size(sample->lost_bytes,
++                                                   f->plen);
++    sample->lost_packets++;
++
++    sample_rtt = ngx_current_msec - f->send_time;
++    if (sample->sample_rtt == 0 || sample_rtt < sample->sample_rtt) {
++        sample->sample_rtt = sample_rtt;
++    }
++
++    if (sample->acked_packets == 0
++        && (sample->lost_packets == 1 || f->pnum >= sample->largest_acked))
++    {
++        sample->largest_acked = f->pnum;
++
++        ngx_quic_sampler_save_state(f, &state);
++        sample->last_packet_state = state;
++    }
++
++    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
++                   "quic sampler lost pn:%uL lost:%uz total:%uL rtt:%M",
++                   f->pnum, sample->lost_bytes,
++                   sampler->total_bytes_lost, sample->sample_rtt);
++}
++
++
++void
++ngx_quic_sampler_on_app_limited(ngx_connection_t *c)
++{
++    ngx_quic_sampler_t     *sampler;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    sampler = qc->sampler;
++
++    sampler->app_limited = 1;
++    sampler->end_app_limited_pnum = sampler->last_sent_pnum;
++}
++
++
++void
++ngx_quic_sampler_enable_overestimate_avoidance(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    qc->sampler->ack_height_threshold = 2000;
++}
++
++
++void
++ngx_quic_sampler_set_reduce_extra_acked(ngx_connection_t *c,
++    ngx_uint_t enable)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    qc->sampler->reduce_extra_acked_on_bw_increase = enable;
++}
++
++
++void
++ngx_quic_sampler_reset_ack_height(ngx_connection_t *c, uint64_t round)
++{
++    ngx_quic_sampler_t     *sampler;
++    ngx_quic_ack_height_t  *height;
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++    if (qc == NULL) {
++        return;
++    }
++
++    sampler = qc->sampler;
++
++    ngx_memzero(sampler->ack_height_filter,
++                sizeof(sampler->ack_height_filter));
++
++    height = &sampler->ack_height_filter[round % NGX_QUIC_ACK_HEIGHT_WINDOW];
++    height->round = round;
++}
++
++
++size_t
++ngx_quic_sampler_max_ack_height(ngx_connection_t *c, uint64_t round)
++{
++    uint64_t                 min_round, max;
++    ngx_uint_t               i;
++    ngx_quic_sampler_t      *sampler;
++    ngx_quic_ack_height_t   *height;
++    ngx_quic_connection_t   *qc;
++
++    qc = ngx_quic_get_connection(c);
++    sampler = qc->sampler;
++
++    max = 0;
++    min_round = (round > NGX_QUIC_ACK_HEIGHT_WINDOW)
++                ? round - NGX_QUIC_ACK_HEIGHT_WINDOW : 0;
++
++    for (i = 0; i < NGX_QUIC_ACK_HEIGHT_WINDOW; i++) {
++        height = &sampler->ack_height_filter[i];
++
++        if (height->round < min_round) {
++            continue;
++        }
++
++        max = ngx_max(max, height->extra_acked);
++    }
++
++    return (size_t) max;
++}
++
++
++size_t
++ngx_quic_sampler_update_ack_height(ngx_connection_t *c, uint64_t bandwidth,
++    ngx_uint_t is_new_max, uint64_t round, ngx_msec_t now)
++{
++    uint64_t                 newly_acked, expected, extra, scaled_acked,
++                             scaled_expected;
++    ngx_msec_t               delta;
++    ngx_quic_sampler_t      *sampler;
++    ngx_quic_ack_height_t   *height;
++    ngx_quic_connection_t   *qc;
++
++    qc = ngx_quic_get_connection(c);
++    sampler = qc->sampler;
++
++    newly_acked = sampler->total_bytes_acked
++                  - sampler->total_bytes_acked_after_last_event;
++
++    if (newly_acked == 0 || bandwidth == 0) {
++        return 0;
++    }
++
++    sampler->total_bytes_acked_after_last_event = sampler->total_bytes_acked;
++
++    if (sampler->reduce_extra_acked_on_bw_increase && is_new_max) {
++        uint64_t             recal_expected;
++        ngx_uint_t           idx;
++        ngx_quic_ack_height_t *h;
++
++        for (idx = 0; idx < NGX_QUIC_ACK_HEIGHT_WINDOW; idx++) {
++            h = &sampler->ack_height_filter[idx];
++            if (h->extra_acked == 0) {
++                continue;
++            }
++
++            recal_expected = ngx_quic_sampler_mul_div(bandwidth, h->delta, 1000);
++
++            if (recal_expected < h->bytes_acked) {
++                h->extra_acked = h->bytes_acked - recal_expected;
++            } else {
++                ngx_memzero(h, sizeof(ngx_quic_ack_height_t));
++            }
++        }
++    }
++
++    if (!sampler->ack_epoch_started) {
++        sampler->ack_epoch_started = 1;
++        sampler->ack_epoch_start = now;
++        sampler->ack_epoch_bytes = newly_acked;
++        return 0;
++    }
++
++    delta = now - sampler->ack_epoch_start;
++    delta = ngx_max(delta, 1);
++    expected = ngx_quic_sampler_mul_div(bandwidth, delta, 1000);
++
++    scaled_acked = ngx_quic_sampler_mul_div(sampler->ack_epoch_bytes,
++                                            1000, 1);
++    scaled_expected = ngx_quic_sampler_mul_div(expected,
++                                               sampler->ack_height_threshold,
++                                               1);
++
++    if (scaled_acked <= scaled_expected) {
++        sampler->ack_epoch_start = now;
++        sampler->ack_epoch_bytes = newly_acked;
++        return 0;
++    }
++
++    sampler->ack_epoch_bytes =
++        ngx_quic_sampler_add(sampler->ack_epoch_bytes, newly_acked);
++
++    extra = (sampler->ack_epoch_bytes > expected)
++            ? sampler->ack_epoch_bytes - expected : 0;
++
++    height = &sampler->ack_height_filter[round % NGX_QUIC_ACK_HEIGHT_WINDOW];
++
++    if (height->round != round || extra > height->extra_acked) {
++        height->round = round;
++        height->extra_acked = extra;
++        height->bytes_acked = sampler->ack_epoch_bytes;
++        height->delta = delta;
++    }
++
++    return (size_t) extra;
++}
++
++
++uint64_t
++ngx_quic_sampler_total_acked(ngx_connection_t *c)
++{
++    ngx_quic_connection_t  *qc;
++
++    qc = ngx_quic_get_connection(c);
++
++    return qc->sampler->total_bytes_acked;
++}
++
++
++static uint64_t
++ngx_quic_sampler_rate(size_t bytes, ngx_msec_t delta)
++{
++    if (bytes == 0) {
++        return 0;
++    }
++
++    if (delta == 0) {
++        delta = 1;
++    }
++
++    if ((uint64_t) bytes > (uint64_t) -1 / 1000) {
++        return (uint64_t) -1;
++    }
++
++    return (uint64_t) bytes * 1000 / delta;
++}
++
++
++static size_t
++ngx_quic_sampler_add_size(size_t a, size_t b)
++{
++    if (a > NGX_MAX_SIZE_T_VALUE - b) {
++        return NGX_MAX_SIZE_T_VALUE;
++    }
++
++    return a + b;
++}
++
++
++static uint64_t
++ngx_quic_sampler_add(uint64_t a, uint64_t b)
++{
++    if (a > (uint64_t) -1 - b) {
++        return (uint64_t) -1;
++    }
++
++    return a + b;
++}
++
++
++static uint64_t
++ngx_quic_sampler_mul_div(uint64_t value, uint64_t multiplier, uint64_t divisor)
++{
++    if (divisor == 0) {
++        return (uint64_t) -1;
++    }
++
++    if (multiplier != 0 && value > (uint64_t) -1 / multiplier) {
++        return (uint64_t) -1;
++    }
++
++    return value * multiplier / divisor;
++}
++
++
++static void
++ngx_quic_sampler_save_state(ngx_quic_frame_t *f,
++    ngx_quic_sample_send_state_t *state)
++{
++    state->valid = 1;
++    state->app_limited = f->sampler_app_limited;
++    state->total_bytes_sent = f->sampler_total_sent;
++    state->total_bytes_acked = f->sampler_total_acked;
++    state->total_bytes_lost = f->sampler_total_lost;
++    state->bytes_in_flight = f->sampler_in_flight;
++}
+diff --git a/src/event/quic/ngx_event_quic_sampler.h b/src/event/quic/ngx_event_quic_sampler.h
+new file mode 100644
+index 0000000..9ef099d
+--- /dev/null
++++ b/src/event/quic/ngx_event_quic_sampler.h
+@@ -0,0 +1,102 @@
++/*
++ * Copyright (C) Nginx, Inc.
++ */
++
++
++#ifndef _NGX_EVENT_QUIC_SAMPLER_H_INCLUDED_
++#define _NGX_EVENT_QUIC_SAMPLER_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++#ifndef NGX_QUIC_FRAME_T_DEFINED
++#define NGX_QUIC_FRAME_T_DEFINED
++typedef struct ngx_quic_frame_s        ngx_quic_frame_t;
++#endif
++
++
++#define NGX_QUIC_SAMPLER_INVALID_PNUM  (uint64_t) -1
++#define NGX_QUIC_ACK_HEIGHT_WINDOW      10
++
++
++typedef struct {
++    ngx_uint_t                        valid;
++    ngx_uint_t                        app_limited;
++    uint64_t                          total_bytes_sent;
++    uint64_t                          total_bytes_acked;
++    uint64_t                          total_bytes_lost;
++    size_t                            bytes_in_flight;
++} ngx_quic_sample_send_state_t;
++
++
++typedef struct {
++    uint64_t                          extra_acked;
++    uint64_t                          bytes_acked;
++    ngx_msec_t                        delta;
++    uint64_t                          round;
++} ngx_quic_ack_height_t;
++
++
++typedef struct {
++    uint64_t                          total_bytes_sent;
++    uint64_t                          total_bytes_acked;
++    uint64_t                          total_bytes_lost;
++    uint64_t                          total_bytes_acked_after_last_event;
++    uint64_t                          total_bytes_sent_at_last_ack;
++    uint64_t                          last_sent_pnum;
++    uint64_t                          last_acked_pnum;
++    uint64_t                          next_round_pnum;
++    uint64_t                          end_app_limited_pnum;
++    ngx_msec_t                        last_acked_sent_time;
++    ngx_msec_t                        last_acked_ack_time;
++    ngx_uint_t                        app_limited;
++    ngx_uint_t                        ack_epoch_started;
++    ngx_uint_t                        ack_height_threshold;
++    ngx_uint_t                        reduce_extra_acked_on_bw_increase;
++    ngx_msec_t                        ack_epoch_start;
++    uint64_t                          ack_epoch_bytes;
++    ngx_quic_ack_height_t             ack_height_filter[NGX_QUIC_ACK_HEIGHT_WINDOW];
++} ngx_quic_sampler_t;
++
++
++typedef struct {
++    uint64_t                          delivery_rate;
++    uint64_t                          send_rate;
++    ngx_msec_t                        sample_rtt;
++    size_t                            acked_bytes;
++    size_t                            lost_bytes;
++    ngx_uint_t                        acked_packets;
++    ngx_uint_t                        lost_packets;
++    size_t                            extra_acked;
++    ngx_uint_t                        round_start;
++    ngx_uint_t                        sample_is_app_limited;
++    uint64_t                          largest_acked;
++    size_t                            prior_in_flight;
++    ngx_quic_sample_send_state_t      last_packet_state;
++} ngx_quic_sample_t;
++
++
++ngx_int_t ngx_quic_sampler_init(ngx_connection_t *c);
++void ngx_quic_sampler_reset_path(ngx_connection_t *c);
++void ngx_quic_sampler_sample_init(ngx_quic_sample_t *sample);
++void ngx_quic_sampler_on_packet_sent(ngx_connection_t *c,
++    ngx_quic_frame_t *f);
++void ngx_quic_sampler_on_packet_acked(ngx_connection_t *c,
++    ngx_quic_frame_t *f, ngx_quic_sample_t *sample);
++void ngx_quic_sampler_on_packet_lost(ngx_connection_t *c,
++    ngx_quic_frame_t *f, ngx_quic_sample_t *sample);
++void ngx_quic_sampler_on_app_limited(ngx_connection_t *c);
++void ngx_quic_sampler_enable_overestimate_avoidance(ngx_connection_t *c);
++void ngx_quic_sampler_set_reduce_extra_acked(ngx_connection_t *c,
++    ngx_uint_t enable);
++void ngx_quic_sampler_reset_ack_height(ngx_connection_t *c, uint64_t round);
++size_t ngx_quic_sampler_max_ack_height(ngx_connection_t *c, uint64_t round);
++size_t ngx_quic_sampler_update_ack_height(ngx_connection_t *c,
++    uint64_t bandwidth, ngx_uint_t is_new_max, uint64_t round,
++    ngx_msec_t now);
++uint64_t ngx_quic_sampler_total_acked(ngx_connection_t *c);
++
++
++#endif /* _NGX_EVENT_QUIC_SAMPLER_H_INCLUDED_ */
+diff --git a/src/event/quic/ngx_event_quic_transport.h b/src/event/quic/ngx_event_quic_transport.h
+index 656cb09..d6f0d6d 100644
+--- a/src/event/quic/ngx_event_quic_transport.h
++++ b/src/event/quic/ngx_event_quic_transport.h
+@@ -258,7 +258,10 @@ typedef struct {
+ } ngx_quic_path_challenge_frame_t;
+ 
+ 
++#ifndef NGX_QUIC_FRAME_T_DEFINED
++#define NGX_QUIC_FRAME_T_DEFINED
+ typedef struct ngx_quic_frame_s                 ngx_quic_frame_t;
++#endif
+ 
+ struct ngx_quic_frame_s {
+     ngx_uint_t                                  type;
+@@ -272,6 +275,16 @@ struct ngx_quic_frame_s {
+     unsigned                                    pkt_need_ack:1;
+     unsigned                                    ignore_congestion:1;
+     unsigned                                    ignore_loss:1;
++    unsigned                                    sampler_app_limited:1;
++
++    uint64_t                                    sampler_total_sent;
++    uint64_t                                    sampler_total_acked;
++    uint64_t                                    sampler_total_lost;
++    uint64_t                                    sampler_total_sent_at_last_ack;
++    size_t                                      sampler_in_flight;
++    ngx_msec_t                                  sampler_delivered_time;
++    ngx_msec_t                                  sampler_last_acked_sent_time;
++    ngx_msec_t                                  sampler_last_acked_ack_time;
+ 
+     ngx_chain_t                                *data;
+     union {
+diff --git a/src/http/v3/ngx_http_v3_module.c b/src/http/v3/ngx_http_v3_module.c
+index 139bd65..420dd66 100644
+--- a/src/http/v3/ngx_http_v3_module.c
++++ b/src/http/v3/ngx_http_v3_module.c
+@@ -18,6 +18,24 @@ static char *ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent,
+     void *child);
+ static char *ngx_http_quic_host_key(ngx_conf_t *cf, ngx_command_t *cmd,
+     void *conf);
++static char *ngx_http_quic_brutal_up(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf);
++
++
++static ngx_conf_enum_t  ngx_http_quic_congestion[] = {
++    { ngx_string("default"), NGX_QUIC_CONGESTION_DEFAULT },
++    { ngx_string("bbr"), NGX_QUIC_CONGESTION_BBR },
++    { ngx_string("brutal"), NGX_QUIC_CONGESTION_BRUTAL },
++    { ngx_null_string, 0 }
++};
++
++
++static ngx_conf_enum_t  ngx_http_quic_bbr_profile[] = {
++    { ngx_string("standard"), NGX_QUIC_BBR_PROFILE_STANDARD },
++    { ngx_string("conservative"), NGX_QUIC_BBR_PROFILE_CONSERVATIVE },
++    { ngx_string("aggressive"), NGX_QUIC_BBR_PROFILE_AGGRESSIVE },
++    { ngx_null_string, 0 }
++};
+ 
+ 
+ static ngx_command_t  ngx_http_v3_commands[] = {
+@@ -64,6 +82,34 @@ static ngx_command_t  ngx_http_v3_commands[] = {
+       offsetof(ngx_http_v3_srv_conf_t, quic.gso_enabled),
+       NULL },
+ 
++    { ngx_string("quic_congestion"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_enum_slot,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_v3_srv_conf_t, quic.congestion),
++      &ngx_http_quic_congestion },
++
++    { ngx_string("quic_bbr_profile"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_enum_slot,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_v3_srv_conf_t, quic.bbr_profile),
++      &ngx_http_quic_bbr_profile },
++
++    { ngx_string("quic_brutal_up"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
++      ngx_http_quic_brutal_up,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_v3_srv_conf_t, quic.brutal_up),
++      NULL },
++
++    { ngx_string("quic_brutal_compensate_loss"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
++      ngx_conf_set_flag_slot,
++      NGX_HTTP_SRV_CONF_OFFSET,
++      offsetof(ngx_http_v3_srv_conf_t, quic.brutal_compensate_loss),
++      NULL },
++
+     { ngx_string("quic_host_key"),
+       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+       ngx_http_quic_host_key,
+@@ -206,6 +252,10 @@ ngx_http_v3_create_srv_conf(ngx_conf_t *cf)
+     h3scf->quic.max_concurrent_streams_uni = NGX_HTTP_V3_MAX_UNI_STREAMS;
+     h3scf->quic.retry = NGX_CONF_UNSET;
+     h3scf->quic.gso_enabled = NGX_CONF_UNSET;
++    h3scf->quic.congestion = NGX_CONF_UNSET_UINT;
++    h3scf->quic.bbr_profile = NGX_CONF_UNSET_UINT;
++    h3scf->quic.brutal_up = NGX_CONF_UNSET_SIZE;
++    h3scf->quic.brutal_compensate_loss = NGX_CONF_UNSET;
+     h3scf->quic.stream_close_code = NGX_HTTP_V3_ERR_NO_ERROR;
+     h3scf->quic.stream_reject_code_bidi = NGX_HTTP_V3_ERR_REQUEST_REJECTED;
+     h3scf->quic.active_connection_id_limit = NGX_CONF_UNSET_UINT;
+@@ -243,6 +293,22 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
+ 
+     ngx_conf_merge_value(conf->quic.retry, prev->quic.retry, 0);
+     ngx_conf_merge_value(conf->quic.gso_enabled, prev->quic.gso_enabled, 0);
++    ngx_conf_merge_uint_value(conf->quic.congestion, prev->quic.congestion,
++                              NGX_QUIC_CONGESTION_DEFAULT);
++    ngx_conf_merge_uint_value(conf->quic.bbr_profile, prev->quic.bbr_profile,
++                              NGX_QUIC_BBR_PROFILE_STANDARD);
++    ngx_conf_merge_size_value(conf->quic.brutal_up, prev->quic.brutal_up, 0);
++    ngx_conf_merge_value(conf->quic.brutal_compensate_loss,
++                         prev->quic.brutal_compensate_loss, 0);
++
++    if (conf->quic.congestion == NGX_QUIC_CONGESTION_BRUTAL
++        && conf->quic.brutal_up == 0)
++    {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                           "quic_congestion brutal requires "
++                           "quic_brutal_up greater than zero");
++        return NGX_CONF_ERROR;
++    }
+ 
+     ngx_conf_merge_str_value(conf->quic.host_key, prev->quic.host_key, "");
+ 
+@@ -391,3 +457,75 @@ failed:
+ 
+     return NGX_CONF_ERROR;
+ }
++
++
++static char *
++ngx_http_quic_brutal_up(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    char  *p = conf;
++
++    u_char     *unit;
++    size_t     *sp, factor, nlen;
++    ssize_t     n;
++    ngx_str_t  *value;
++
++    sp = (size_t *) (p + cmd->offset);
++
++    if (*sp != NGX_CONF_UNSET_SIZE) {
++        return "is duplicate";
++    }
++
++    value = cf->args->elts;
++
++    if (value[1].len <= 4) {
++        goto invalid;
++    }
++
++    unit = value[1].data + value[1].len - 4;
++    nlen = value[1].len - 4;
++
++    n = ngx_atosz(value[1].data, nlen);
++    if (n == NGX_ERROR || n == 0) {
++        goto invalid;
++    }
++
++    if (ngx_strncmp(unit, "kbps", 4) == 0) {
++        factor = 125;
++
++    } else if (ngx_strncmp(unit, "mbps", 4) == 0) {
++        factor = 125000;
++
++    } else if (ngx_strncmp(unit, "gbps", 4) == 0) {
++        factor = 125000000;
++
++    } else if (ngx_strncmp(unit, "KBps", 4) == 0) {
++        factor = 1000;
++
++    } else if (ngx_strncmp(unit, "MBps", 4) == 0) {
++        factor = 1000000;
++
++    } else if (ngx_strncmp(unit, "GBps", 4) == 0) {
++        factor = 1000000000;
++
++    } else {
++        goto invalid;
++    }
++
++    if ((size_t) n > NGX_MAX_SIZE_T_VALUE / factor) {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                           "quic_brutal_up value \"%V\" is too large",
++                           &value[1]);
++        return NGX_CONF_ERROR;
++    }
++
++    *sp = (size_t) n * factor;
++
++    return NGX_CONF_OK;
++
++invalid:
++
++    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                       "invalid quic_brutal_up value \"%V\"", &value[1]);
++
++    return NGX_CONF_ERROR;
++}
+-- 
+2.55.0.windows.2
+

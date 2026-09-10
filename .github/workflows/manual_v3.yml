@@ -16,9 +16,10 @@ on:
         type: string
       nginx_patch_libs:
         description: "use nginx patch libs"
-        default: "1.31.0"
+        default: "1.31.5"
         type: choice
         options:
+          - "1.31.5"
           - "1.31.0"
           - "1.30.0"
           - "native"
