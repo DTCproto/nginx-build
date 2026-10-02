@@ -146,3 +146,17 @@ nginx 动态模块使用 nginx 二进制文件中的符号，但动态模块不�
 将 boringssl 编译为共享库（使用-DBUILD_SHARED_LIBS=1）。确保 boringssl 库路径在 nginx 二进制启动期间可用（例如，使用 LD_LIBRARY_PATH 变量）。
 将 njs 模块编译为内置模块（--add-module），这里可以使用 static boringssl
 ```
+
+# 四、前置镜像 debian-slim:clang
+
+### 镜像链
+
+```text
+debian:trixie-slim
+  └─ debian-slim:clang（滚动）/ debian-slim:clang-23 / debian-slim:clang-22   前置镜像
+        └─ base-ssl:<ssl_commit>-{boringssl|boringssl-static}
+              ├─ nginx:<nginx_commit>-<ssl_commit>-base-boringssl
+              │     └─ nginx:<nginx_commit>-<ssl_commit>-boringssl（生产运行阶段仍基于 debian:trixie-slim）
+              ├─ nginx:<nginx_commit>-<ssl_commit>-base-boringssl-lite
+              └─ nginx:<nginx_commit>-<ssl_commit>-angie-base-boringssl-lite
+```

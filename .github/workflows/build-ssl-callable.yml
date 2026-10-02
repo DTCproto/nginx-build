@@ -18,6 +18,10 @@ on:
         required: true
         type: boolean
         description: "是否推送镜像到 registry"
+      base_image:
+        required: true
+        type: string
+        description: "构建阶段基础镜像（对应 Dockerfile 的 BASE_IMAGE 构建参数）"
       tag_suffix:
         required: true
         type: string
@@ -124,6 +128,7 @@ jobs:
           build-args: |
             BUILD_SHARED_LIBS=${{ inputs.build_shared_libs }}
             BORINGSSL_COMMIT_ID=${{ inputs.ssl_commit_id }}
+            BASE_IMAGE=${{ inputs.base_image }}
           push: ${{ inputs.release_archives }}
           provenance: false
           tags: |

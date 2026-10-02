@@ -1,4 +1,7 @@
-FROM debian:trixie-slim AS builder
+# 基础镜像必须由外部传入（无默认值）
+ARG BASE_IMAGE
+
+FROM ${BASE_IMAGE} AS builder
 
 ARG BORINGSSL_COMMIT_ID="HEAD~0"
 ARG BUILD_SHARED_LIBS="1"
@@ -39,33 +42,6 @@ RUN set -eux; \
 		; \
 	rm -rf /var/lib/apt/lists/*; \
 	mkdir -p /usr/src;
-
-#################################################################################################
-
-### 安装 Clang 22
-RUN set -eux; \
-	mkdir -p /opt/clang; \
-	cd /opt/clang; \
-	wget -qO llvm.sh \
-		--tries=5 \
-		--timeout=30 \
-		--waitretry=5 \
-		https://apt.llvm.org/llvm.sh; \
-	chmod +x llvm.sh; \
-	./llvm.sh 22 all; \
-	# 创建符号链接，以便 CMake 能找到 clang/clang++
-	ln -sf /usr/bin/clang-22 /usr/local/bin/clang; \
-	ln -sf /usr/bin/clang++-22 /usr/local/bin/clang++; \
-	ln -sf /usr/bin/lld-22 /usr/local/bin/lld;
-
-# 将 Clang 22 的 bin 目录置于 PATH 最前面
-ENV PATH="/usr/lib/llvm-22/bin:${PATH}"
-
-ENV CC=clang
-ENV CXX=clang++
-ENV AR=llvm-ar
-ENV RANLIB=llvm-ranlib
-ENV NM=llvm-nm
 
 #################################################################################################
 

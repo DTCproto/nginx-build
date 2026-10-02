@@ -62,6 +62,7 @@ jobs:
     uses: ./.github/workflows/build-ssl-callable.yml
     with:
       ssl_commit_id: ${{ inputs.ssl_commit_id }}
+      base_image: ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/debian-slim:clang
       build_shared_libs: "0"
       release_archives: ${{ inputs.release_archives }}
       tag_suffix: "boringssl-static"
@@ -83,6 +84,7 @@ jobs:
     uses: ./.github/workflows/build-ssl-callable.yml
     with:
       ssl_commit_id: ${{ inputs.ssl_commit_id }}
+      base_image: ghcr.io/${{ needs.pre.outputs.ACTOR_LC }}/debian-slim:clang
       build_shared_libs: "1"
       release_archives: ${{ inputs.release_archives }}
       tag_suffix: "boringssl"
